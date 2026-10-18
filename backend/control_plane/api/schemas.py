@@ -3,7 +3,7 @@
 from datetime import datetime, timezone
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, StringConstraints, field_validator
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, JsonValue, StringConstraints, field_validator
 
 
 ApplicationName = Annotated[
@@ -46,3 +46,17 @@ class DeploymentRead(StoredRecord):
     application_id: int
     specification: dict[str, JsonValue]
     runtime_status: Literal["pending", "starting", "healthy", "failed", "stopped"]
+
+
+class WorkerRegister(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    identity: ApplicationName
+
+
+class WorkerRead(BaseModel):
+    id: int
+    identity: str
+    registered_at: AwareDatetime
+    last_heartbeat_at: AwareDatetime
+    status: Literal["available", "unavailable"]

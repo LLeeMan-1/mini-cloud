@@ -3,7 +3,8 @@
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import CheckConstraint, DDL, ForeignKey, JSON, String, event
+from sqlalchemy import CheckConstraint, DDL, DateTime, ForeignKey, JSON, String, event
+from sqlalchemy.types import TypeDecorator
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -38,6 +39,32 @@ class Deployment(Base):
     created_at: Mapped[datetime] = mapped_column(default=utc_now)
     specification: Mapped[dict[str, Any]] = mapped_column(JSON)
     runtime_status: Mapped[str] = mapped_column(String(20), default="pending")
+
+
+class UTCDateTime(TypeDecorator):
+    """SQLite stores UTC without an offset; Python always receives aware UTC."""
+
+    impl = DateTime
+    cache_ok = True
+
+    def process_bind_param(self, value, dialect):
+        if value is None:
+            return None
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("Timestamp must be timezone-aware")
+        return value.astimezone(timezone.utc).replace(tzinfo=None)
+
+    def process_result_value(self, value, dialect):
+        return value.replace(tzinfo=timezone.utc) if value is not None else None
+
+
+class Worker(Base):
+    __tablename__ = "workers"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    identity: Mapped[str] = mapped_column(String(100), unique=True)
+    registered_at: Mapped[datetime] = mapped_column(UTCDateTime())
+    last_heartbeat_at: Mapped[datetime] = mapped_column(UTCDateTime())
 
 
 # Enforce immutability even for direct SQL updates, while allowing status updates.
