@@ -22,13 +22,18 @@ def positive_seconds(value: str) -> float:
 
 
 def run_agent(
-    client: httpx.Client, identity: str, interval: float = 5, *, stop_event: Event | None = None
+    client: httpx.Client, identity: str, interval: float = 5, *, stop_event: Event | None = None,
+    poll_jobs: bool = False,
 ) -> None:
     if not identity.strip() or len(identity.strip()) > 100:
         raise ValueError("Identity must have 1–100 characters")
     if not math.isfinite(interval) or interval <= 0:
         raise ValueError("Heartbeat interval must be finite and positive")
     stop = stop_event if stop_event is not None else Event()
+    if poll_jobs:
+        from backend.worker.jobs import run_job_agent
+        run_job_agent(client, identity, interval, stop)
+        return
     worker_id = None
     retry_delay = 1.0
     while not stop.is_set():
@@ -69,13 +74,14 @@ def main() -> None:
     parser.add_argument("--api-url", default="http://127.0.0.1:8000")
     parser.add_argument("--heartbeat-interval", type=positive_seconds, default=5.0)
     parser.add_argument("--request-timeout", type=positive_seconds, default=5.0)
+    parser.add_argument("--poll-jobs", action="store_true", help="Poll and complete simulated jobs only")
     args = parser.parse_args()
     if not args.identity.strip() or len(args.identity.strip()) > 100:
         parser.error("Identity must have 1–100 characters")
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     try:
         with httpx.Client(base_url=args.api_url, timeout=args.request_timeout) as client:
-            run_agent(client, args.identity, args.heartbeat_interval)
+            run_agent(client, args.identity, args.heartbeat_interval, poll_jobs=args.poll_jobs)
     except KeyboardInterrupt:
         logger.info("Worker stopped")
     except httpx.HTTPStatusError as error:

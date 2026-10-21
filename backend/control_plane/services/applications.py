@@ -6,7 +6,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from backend.control_plane.persistence.models import Application, Deployment
+from backend.control_plane.persistence.models import Application, Deployment, Job
 
 
 class ApplicationNotFound(Exception):
@@ -36,6 +36,8 @@ def create_deployment(
         runtime_status="pending",
     )
     session.add(deployment)
+    session.flush()
+    session.add(Job(deployment_id=deployment.id))
     session.commit()
     session.refresh(deployment)
     return deployment

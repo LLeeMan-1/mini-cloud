@@ -2,10 +2,10 @@
 
 from sqlalchemy.engine import Engine
 
-from backend.control_plane.persistence.models import Base
+from backend.control_plane.persistence.models import Base, Job
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def initialize_database(engine: Engine) -> None:
@@ -49,6 +49,16 @@ def initialize_database(engine: Engine) -> None:
                     connection.exec_driver_sql("ALTER TABLE workers_migration_v1 RENAME TO workers")
                 Base.metadata.create_all(connection)
                 connection.exec_driver_sql("INSERT INTO schema_migrations (version) VALUES (1)")
+            if version < 2:
+                Job.__table__.create(connection, checkfirst=True)
+                connection.exec_driver_sql("""
+                    INSERT INTO jobs (deployment_id, kind, state, created_at)
+                    SELECT d.id, 'prepare_deployment', 'queued', d.created_at
+                    FROM deployments AS d
+                    WHERE d.runtime_status = 'pending'
+                      AND NOT EXISTS (SELECT 1 FROM jobs AS j WHERE j.deployment_id = d.id)
+                """)
+                connection.exec_driver_sql("INSERT INTO schema_migrations (version) VALUES (2)")
             connection.commit()
         except BaseException:
             connection.rollback()
