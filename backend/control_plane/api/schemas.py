@@ -82,6 +82,37 @@ class JobRead(BaseModel):
     claim_id: UUID | None
     result: dict[str, JsonValue] | None
     error: str | None
+    attempt_count: int
+    max_attempts: int
+    next_run_at: AwareDatetime
+    assignment_expires_at: AwareDatetime | None
+    lease_expires_at: AwareDatetime | None
+    last_failure_code: str | None
+
+
+class ClaimRead(JobRead):
+    server_time: AwareDatetime
+    renewal_interval: float
+
+
+class ReportRead(JobRead):
+    acknowledged_attempt_number: int
+    attempt_outcome: Literal["completed", "failed"]
+
+
+class AttemptRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    number: int
+    worker_id: int
+    state: Literal["assigned", "claimed", "completed", "failed", "expired"]
+    claim_id: UUID | None
+    assigned_at: AwareDatetime
+    claimed_at: AwareDatetime | None
+    finished_at: AwareDatetime | None
+    failure_code: str | None
+    retryable: bool
+    result: dict[str, JsonValue] | None
+    error: str | None
 
 
 class JobAssignment(BaseModel):
@@ -90,23 +121,44 @@ class JobAssignment(BaseModel):
     kind: Literal["prepare_deployment"]
     state: Literal["assigned"]
     specification: dict[str, JsonValue]
+    attempt_number: int
+    assignment_expires_at: AwareDatetime
 
 
 class JobClaim(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     claim_id: UUID
+    attempt_number: Annotated[int, Field(strict=True, gt=0)]
+
+
+class JobRenew(JobClaim):
+    renewal_id: UUID
+
+
+class RenewalRead(BaseModel):
+    job_id: int
+    worker_id: int
+    attempt_number: int
+    claim_id: UUID
+    renewal_id: UUID
+    lease_expires_at: AwareDatetime
+    server_time: AwareDatetime
+    renewal_interval: float
 
 
 class JobReport(JobClaim):
     outcome: Literal["completed", "failed"]
     result: dict[str, JsonValue] | None = None
+    retryable: bool = Field(default=False, strict=True)
     error: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=2000)] | None = None
 
     @model_validator(mode="after")
     def coherent_outcome(self):
         if self.outcome == "completed" and self.error is not None:
             raise ValueError("Completed reports cannot contain an error")
+        if self.outcome == "completed" and self.retryable:
+            raise ValueError("Only failures may be retryable")
         if self.outcome == "failed" and (self.error is None or self.result is not None):
             raise ValueError("Failed reports require an error and cannot contain a result")
         if self.result is not None and len(json.dumps(self.result).encode("utf-8")) > 16384:
@@ -117,6 +169,19 @@ class JobReport(JobClaim):
 class SchedulingAssignment(BaseModel):
     job_id: int
     worker_id: int
+    attempt_number: int
+
+
+class RecoveryItem(BaseModel):
+    job_id: int
+    attempt_number: int
+    state: JobState
+    failure_code: str
+
+
+class RecoveryResult(BaseModel):
+    recovered_count: int
+    recovered: list[RecoveryItem]
 
 
 class SchedulingResult(BaseModel):

@@ -136,7 +136,7 @@ def test_claim_conflict_does_not_crash_polling_agent():
         if path.endswith("/claim"):
             return httpx.Response(409)
         if path.endswith("/jobs"):
-            return httpx.Response(200, json=[{"id": 1, "kind": "prepare_deployment"}])
+            return httpx.Response(200, json=[{"id": 1, "kind": "prepare_deployment", "attempt_number": 1}])
         if path.endswith("/heartbeat"):
             heartbeats.append(path)
         return httpx.Response(200, json={"id": 1})
@@ -154,18 +154,18 @@ def test_opt_in_dispatch(monkeypatch):
     assert len(called) == 1
 
 
-def test_replayed_claim_already_terminal_is_not_reported_again():
+def test_replayed_claim_explicitly_rejected_is_not_reported_again():
     paths = []
 
     def handler(request):
         paths.append(request.url.path)
         if request.method == "GET":
-            return httpx.Response(200, json=[{"id": 1, "kind": "prepare_deployment"}])
-        return httpx.Response(200, json={"state": "completed"})
+            return httpx.Response(200, json=[{"id": 1, "kind": "prepare_deployment", "attempt_number": 1}])
+        return httpx.Response(409)
 
     poller = JobPoller()
     with httpx.Client(base_url="http://test", transport=httpx.MockTransport(handler)) as client:
         assert poller.step(client, 1) is True
-        assert poller.step(client, 1) is False
-    assert poller.pending is None
+        with pytest.raises(httpx.HTTPStatusError):
+            poller.step(client, 1)
     assert paths == ["/workers/1/jobs", "/workers/1/jobs/1/claim"]

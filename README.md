@@ -3,7 +3,8 @@
 A lightweight, self-hosted application deployment and orchestration platform.
 Milestone 1A implements FastAPI and SQLite persistence. Milestone 1B adds a separate
 HTTP worker agent, worker registration, and heartbeats. Milestone 1C-A adds persistent
-jobs, explicit basic scheduling, and opt-in simulated job processing. Docker,
+jobs, explicit basic scheduling, and opt-in simulated job processing. Milestone 1C-B
+adds numbered attempts, leases, retries, and explicit failure recovery. Docker,
 application execution, and the frontend are future milestones.
 
 ## Windows PowerShell setup
@@ -42,7 +43,7 @@ then replaces the old workers table within one explicit transaction. `BEGIN IMME
 serializes competing startup migrations. Failure rolls back the schema and data changes
 and prevents startup; a later startup can retry. Repeated startups do not repeat the
 migration, and databases with newer schema versions are rejected. Stop old API processes
-before starting the upgraded version; old code expects the removed status column.
+before starting the upgraded version; old code may expect an older schema/protocol.
 Do not delete or reset the database to upgrade. No migration dependency was added.
 Future schema changes require another explicit versioned migration; `create_all` alone
 does not upgrade tables.
@@ -109,12 +110,15 @@ with an error for operator correction. There is no retry limit for transient err
 | POST | `/workers/register` | Register or refresh a worker by identity; returns 200. |
 | POST | `/workers/{id}/heartbeat` | Refresh a known worker; returns 200, or 404 for an unknown worker. |
 | GET | `/workers` | List workers in ID order with calculated availability. |
-| POST | `/scheduling/run` | Explicitly assign up to 100 jobs; optional `limit=1..100`. |
+| POST | `/scheduling/run` | Recover expired work, then explicitly assign up to 100 ready jobs; optional `limit=1..100`. |
 | GET | `/jobs` | List jobs; filters: `state`, `deployment_id`, `worker_id`; `limit=1..100`, `offset>=0`. |
 | GET | `/jobs/{id}` | Return one durable job. |
 | GET | `/workers/{id}/jobs` | Poll this worker's assigned jobs, including immutable specifications. |
-| POST | `/workers/{id}/jobs/{job_id}/claim` | Claim with a UUID `claim_id`, or confirm an identical retry. |
-| POST | `/workers/{id}/jobs/{job_id}/report` | Report a claimed job as completed or failed. |
+| POST | `/workers/{id}/jobs/{job_id}/claim` | Claim using `attempt_number` and UUID `claim_id`; return a live lease grant. |
+| POST | `/workers/{id}/jobs/{job_id}/report` | Report a live attempt; return its durable acknowledgment. |
+| POST | `/workers/{id}/jobs/{job_id}/renew` | Renew a live lease using attempt, claim, and renewal UUID. |
+| GET | `/jobs/{id}/attempts` | Ordered assignment/claim/outcome history. |
+| POST | `/jobs/recover` | Recover up to 100 expired attempts without assigning new work. |
 
 Worker registration accepts `{"identity":"laptop-worker-1"}`. Identity is case-sensitive,
 trimmed, and must be a string of 1–100 characters; extra fields return 422. A unique
@@ -171,6 +175,7 @@ command binds to the laptop's loopback interface.
 ```text
 backend/control_plane/
   main.py                  App factory and startup/shutdown lifecycle
+  job_policy.py            Validated configurable lease/retry defaults
   api/routes.py            HTTP endpoints and HTTP error mapping
   api/schemas.py           Pydantic input/output contracts
   api/workers.py           Worker HTTP endpoints
@@ -283,151 +288,278 @@ if inspected within 15 seconds of the last heartbeat. Restart the agent with the
 identity to confirm process restarts also reuse the record. All API commands bind to
 localhost; authentication and remote worker setup remain outside this milestone.
 
-## Persistent jobs and explicit scheduling
+## Persistent jobs, attempts, and recovery
 
-Deployment creation inserts one queued `prepare_deployment` job in the same transaction
-as the deployment. The original deployment endpoint and response shape are unchanged.
-One job per deployment is enforced by a unique constraint. A repeated deployment POST
-still creates a separate deployment and job; it is not a deployment idempotency key.
+A deployment and its one durable job are created together. Each assignment creates a
+numbered `JobAttempt` and consumes one of the job's persisted `max_attempts`. HTTP
+retries consume no attempts. Jobs are current state; attempts preserve ownership,
+claim UUID, failure reason, and outcomes. Terminal attempts are immutable. A partial
+unique index still permits exactly one assigned/claimed job per worker.
 
-Job transitions are strictly `queued -> assigned -> claimed -> completed|failed`.
-Services validate ownership and state; a SQLite trigger also rejects invalid state
-transitions, and CHECK constraints require coherent ownership/timestamps. Terminal
-jobs are not retried or requeued. Jobs include UTC creation, assignment, claim, and
-finish timestamps; assignment and claim ownership; and an optional result or error.
+The lifecycle is `queued -> assigned -> claimed -> completed|failed`. Assignment
+expiration, execution lease expiration, or an explicitly retryable failure can instead
+return a job to queued while attempts remain. The closed attempt remains failed or
+expired in history. At the limit the job becomes failed with `attempts_exhausted`.
+Permanent failures become terminal immediately. Neither success nor failure starts an
+application or changes deployment runtime status; new deployments remain pending.
 
-There is no automatic scheduler. `POST /scheduling/run` acquires `BEGIN IMMEDIATE`
-before sampling time or reading workers/jobs. It checks heartbeat freshness and
-capacity, selects queued jobs by `(created_at, id)`, selects eligible idle workers by
-ID, and commits assignments in that same short transaction. Exactly at the worker
-timeout a worker is still eligible. A partial unique index enforces one active
-assigned/claimed job per worker across simultaneous scheduler requests. With no
-eligible workers, jobs remain queued. Polling is read-only and does not schedule.
+All ownership mutations use short `BEGIN IMMEDIATE` transactions, sample UTC after
+acquiring the write reservation, and use conditional writes. Scheduling recovers a
+bounded batch first, then selects eligible queued jobs by `(next_run_at, created_at, id)`
+and fresh idle workers by ID, all inside the same transaction. One call may leave more
+than 100 expirations for a subsequent call. SQLite serializes writers; lock contention
+can still fail a request, which workers retry as a server error.
 
-Claim bodies contain `{"claim_id":"<UUID>"}`. A worker must be assigned the job and
-have a fresh heartbeat for the first claim. Conditional SQL updates and short write
-transactions prevent competing owners. A claim UUID is globally unique across jobs.
-Identical retries by the same worker return the recorded job, including after it has
-finished; a different owner or claim UUID conflicts. Claim IDs are not credentials.
+There is no FastAPI background scheduler. Invoke `/jobs/recover` or `/scheduling/run`
+explicitly. An expired lease is rejected by mutation endpoints immediately, even before
+recovery updates stored state. Polling remains read-only and omits expired assignments.
+Recovery releases worker capacity, closes history, and sets a retry eligibility time;
+it does not assign work until a scheduling operation finds it ready.
 
-Reports contain `claim_id` and `outcome` (`completed` or `failed`). Successful reports
-may contain a JSON-object `result` (at most 16 KiB when serialized). Failed reports
-require a nonblank `error` of at most 2000 characters and cannot contain a result.
-Completed reports cannot contain an error. Reporting requires the assigned worker
-and recorded claim UUID, but a fresh heartbeat is not required for an existing owner.
-An identical report is idempotent; a contradictory outcome/result/error returns 409.
-Missing records return 404, invalid bodies/parameters return 422, and ownership or
-lifecycle conflicts return 409. New job operations otherwise return 200.
+### Defaults and configuration
 
-Simulated success/failure changes only job state: the deployment stays `pending`.
-No specification is executed or modified. An unavailable worker keeps its reserved
-job; there are no leases, reassignment, automatic job retries, or process-restart
-recovery of in-memory claims. Stuck assigned/claimed jobs remain visible through
-`GET /jobs`. Terminal jobs release worker capacity, but assigning more work needs
-another explicit scheduling request. Heartbeat freshness is an observation, not an
-execution guarantee.
+Set these before starting the API. All processes must use the same policy.
 
-To enable the agent's fixed simulation handler, add `--poll-jobs`:
+| Environment variable | Default |
+| --- | --- |
+| `MINI_CLOUD_JOB_ASSIGNMENT_SECONDS` | 15 |
+| `MINI_CLOUD_JOB_LEASE_SECONDS` | 30 |
+| `MINI_CLOUD_JOB_RENEWAL_SECONDS` | 10 |
+| `MINI_CLOUD_JOB_MAX_ATTEMPTS` | 3 total assignments, including the first |
+| `MINI_CLOUD_JOB_RETRY_SECONDS` | 5 |
+| `MINI_CLOUD_JOB_RETRY_CAP_SECONDS` | 60 |
+
+Durations must be finite and positive; renewal must be shorter than the lease. The
+retry cap must be at least the initial delay. Attempts must be a positive integer.
+The attempt limit is persisted per job, so changing configuration does not reset
+existing retry budgets. Retry delays are 5, 10, 20, 40, 60, 60... seconds when the
+configured budget allows that many attempts. Initial jobs are immediately eligible.
+
+An assignment has 15 seconds to be claimed. A claim starts a 30-second lease. A lease
+or assignment is expired at **now >= deadline**. This differs intentionally from the
+worker heartbeat boundary: heartbeat age exactly 15 seconds is still available.
+
+Heartbeats control eligibility for new assignments and first claims. They do not
+renew leases or revoke unexpired leases. A live owner may renew or report even with
+an expired heartbeat. A fresh heartbeat cannot revive expired ownership.
+
+### Protocol and idempotency
+
+Polling responses include `attempt_number` and `assignment_expires_at`. Old job agents
+must upgrade: missing attempt numbers are rejected with 422, never silently mapped
+to the latest attempt. Heartbeat-only worker operation is unchanged.
+
+Claim body:
+
+```json
+{"attempt_number":1,"claim_id":"<UUID>"}
+```
+
+The same worker/attempt/claim can repeat a claim while it is live, without extending
+the deadline. A stale generation, wrong worker/claim, expired assignment, or expired
+lease returns 409. Claim retries after terminal completion are also rejected; durable
+historical acknowledgment is specifically a report feature.
+
+Renewal body:
+
+```json
+{"attempt_number":1,"claim_id":"<UUID>","renewal_id":"<UUID>"}
+```
+
+Renewal extends to the later of the current deadline and `server_now + lease_duration`.
+Reuse the same renewal UUID after an uncertain response. A small `job_renewals` table
+stores receipts so even a delayed replay of an older renewal cannot extend or shorten
+the current lease. This is an intentional extension of the original latest-receipt
+proposal. Receipts remain subject to live-current-owner checks; an expired or replaced
+attempt cannot renew. History/renewal receipts currently have no retention policy.
+
+Claim and renewal responses contain the grant deadline, current `server_time`, and
+`renewal_interval`. A replay grants the same deadline, while `server_time` reflects
+this request. The worker uses the time remaining, not a fresh full lease duration.
+
+Report bodies contain attempt and claim IDs, `outcome`, optional `result` or `error`,
+and `retryable` (false by default). Only failed outcomes can be retryable. A failed
+report requires a nonblank error (up to 2000 characters) and cannot contain a result.
+A completed report can contain a JSON-object result of up to 16 KiB but no error.
+
+An accepted report stores its payload and historical acknowledgment atomically.
+Identical retries return that acknowledgment even after expiration, reassignment,
+completion of a newer attempt, or an API restart. Contradictory reports return 409.
+Acknowledgments contain `acknowledged_attempt_number` and `attempt_outcome`, and their
+job fields describe state **at acceptance time**. Use `GET /jobs/{id}` for current
+state; replaying an old acknowledgment never changes a newer attempt.
+
+Errors use `detail.code` and `detail.message`: examples include `stale_attempt`,
+`assignment_expired`, `lease_expired`, `worker_unavailable`, and `report_conflict`.
+Unknown records return 404; invalid bodies return 422; ownership/state conflicts 409.
+Attempt history exposes `assignment_expired`, `lease_expired`, `retryable_failure`, or
+`permanent_failure`, including original errors. No claim UUID is an authentication
+credential. Development remains on localhost without remote worker support.
+
+### Migration version 3
+
+Startup rebuilds the v2 jobs table transactionally, adds attempt history and renewal
+receipts, and recreates indexes and triggers. Applications, deployments, workers,
+job IDs, original ownership/timestamps, specifications, and terminal outcomes remain
+intact. Existing queued jobs start with zero attempts. Assigned, claimed, completed,
+and failed jobs get attempt 1. Active assignments get a fresh 15-second grace window;
+active claims get a fresh 30-second lease, using one migration timestamp. Terminal
+reports get historical receipts with retryable=false.
+
+Repeated startup neither recreates history nor extends migration grace windows.
+Any failure rolls back data, DDL, and the schema version; later startup can retry.
+Stop old API/worker processes before upgrading. Old migrations now use a frozen v2
+jobs schema rather than today's evolving model. No dependency was added. Tests use
+only temporary files; your development database is upgraded only when you start the API.
+Do not delete or reset it.
+
+### Worker operation and limitations
 
 ```powershell
 .\.venv\Scripts\python.exe -m backend.worker.agent --identity laptop-worker-1 --heartbeat-interval 5 --poll-jobs
 ```
 
-Without this flag, the existing heartbeat-only behavior is unchanged. With it, the
-agent polls every heartbeat interval when idle, claims an assignment with a generated
-UUID, and reports the fixed result `{"simulated":true}`. It never interprets the
-specification. Claim/report UUIDs and payloads survive transient retries within the
-agent process, including a response lost after server commit. They are not saved
-across process restarts. Job-request 409 conflicts abandon that local attempt without
-changing server ownership. A job-request 404 causes re-registration.
+The opt-in agent generates fresh claim/renewal UUIDs and retains them for ambiguous
+network retries within its process. It reports only the fixed `{"simulated":true}`
+result and never interprets the specification. Polling, heartbeats, and renewal have
+independent monotonic deadlines/backoffs; renewal runs before further job processing.
+A conservative local expiry uses the time immediately before the HTTP request plus
+the server's remaining lease, minus a safety margin. Slow responses therefore cannot
+give the worker a fresh full lease. Expiry or an ownership conflict discards local
+simulation state. Heartbeats continue even when work is abandoned.
 
-Polling and heartbeats have independent monotonic deadlines and exponential backoffs.
-Polling backoff does not pause heartbeat scheduling. HTTP requests remain synchronous
-and timeout-bounded, so a slow individual request can delay another operation. No
-worker threads or background API scheduling tasks are introduced. The API remains
-unauthenticated and bound to localhost for development.
+Synchronous HTTP requests remain timeout-bounded and can delay other operations.
+Claim state is not saved across worker process restarts: a new process does not adopt
+an old claim; it expires and is recovered. API downtime longer than a lease can cause
+work to be abandoned even if an unconfirmed renewal succeeded. This is conservative.
 
-The tests cover deployment/job transaction rollback; FIFO and capacity; simultaneous
-scheduling, claims, and reports; wrong owners and invalid transitions; identical
-retries and contradictory reports; job persistence; expired-worker behavior; migration
-backfill and rollback; and agent recovery from responses lost after commit. Agent
-tests bridge HTTPX mock transport to the real FastAPI API with a controlled clock.
-All test databases are temporary; the development database is not opened by tests.
+Leases provide at-least-once attempts, not exactly-once execution. API fencing prevents
+stale database writes; it cannot stop a paused old process, undo external side effects,
+or prevent overlapping external execution after reassignment. Real execution will
+need idempotent resource operations and enforcement beyond this API. Wall-clock jumps
+on the control plane can change deadline behavior. Explicit recovery/scheduling calls
+are still required for progress. No Docker, broker, external execution, or background
+API scheduler is introduced.
 
-## Manual job lifecycle in two VS Code PowerShell terminals
+## Manual lease fault injection in two PowerShell terminals
 
-In terminal 1, stop any older API and start the upgraded API. This example uses a new,
-ignored database under `var` so existing queued jobs and running workers cannot affect
-the deterministic example. It does not delete or reset your development database.
+Stop older API/agents. Terminal 1 starts the API using a fresh ignored test database
+so existing queues cannot interfere. This does not reset your development database:
 
 ```powershell
 Set-Location C:\Projects\mini-cloud-1
-$env:MINI_CLOUD_DATABASE_PATH = Join-Path $PWD ("var\manual-1c-{0}.db" -f [guid]::NewGuid().ToString("N"))
+$env:MINI_CLOUD_DATABASE_PATH = Join-Path $PWD ("var\manual-1cb-{0}.db" -f [guid]::NewGuid().ToString("N"))
 $env:MINI_CLOUD_WORKER_TIMEOUT_SECONDS = "15"
+$env:MINI_CLOUD_JOB_ASSIGNMENT_SECONDS = "15"
+$env:MINI_CLOUD_JOB_LEASE_SECONDS = "30"
+$env:MINI_CLOUD_JOB_RENEWAL_SECONDS = "10"
+$env:MINI_CLOUD_JOB_MAX_ATTEMPTS = "3"
+$env:MINI_CLOUD_JOB_RETRY_SECONDS = "5"
+$env:MINI_CLOUD_JOB_RETRY_CAP_SECONDS = "60"
 .\.venv\Scripts\python.exe -m uvicorn backend.control_plane.main:app --host 127.0.0.1 --port 8000
 ```
 
-In terminal 2, create an application and deployment, then inspect the queued job:
+In terminal 2 define helpers, create a job and worker, and expire its first assignment:
 
 ```powershell
 Set-Location C:\Projects\mini-cloud-1
 $base = "http://127.0.0.1:8000"
-$application = Invoke-RestMethod -Method Post -Uri "$base/applications" -ContentType 'application/json' -Body '{"name":"job-demo"}'
-$deployment = Invoke-RestMethod -Method Post -Uri "$base/applications/$($application.id)/deployments" -ContentType 'application/json' -Body '{"specification":{"image":"demo:v1"}}'
-$job = @(Invoke-RestMethod "$base/jobs?deployment_id=$($deployment.id)")[0]
-$job | Format-List
+function Post-Json($path, $body = $null) {
+    $options = @{ Method = 'Post'; Uri = "$base$path" }
+    if ($null -ne $body) {
+        $options.ContentType = 'application/json'
+        $options.Body = $body | ConvertTo-Json -Depth 10
+    }
+    Invoke-RestMethod @options
+}
+$app = Post-Json '/applications' @{ name = 'lease-demo' }
+function New-DemoJob {
+    $dep = Post-Json "/applications/$($app.id)/deployments" @{ specification = @{ simulated = $true } }
+    @(Invoke-RestMethod "$base/jobs?deployment_id=$($dep.id)")[0]
+}
+$job = New-DemoJob
+$oldWorker = Post-Json '/workers/register' @{ identity = 'old-worker' }
+Post-Json '/scheduling/run' | ConvertTo-Json -Depth 5
+Start-Sleep -Seconds 16
+Post-Json '/jobs/recover' | ConvertTo-Json -Depth 5
+Invoke-RestMethod "$base/jobs/$($job.id)/attempts" | Format-Table
 ```
 
-Register a worker and explicitly schedule. Do not run the polling agent yet, because
-this first example claims and reports manually:
+Attempt 1 is expired and the job is queued with a 5-second delay. Assign attempt 2 to
+that same worker, claim it, then simulate its loss by sending no heartbeats or renewals:
 
 ```powershell
-$worker = Invoke-RestMethod -Method Post -Uri "$base/workers/register" -ContentType 'application/json' -Body '{"identity":"job-demo-worker"}'
-Invoke-RestMethod -Method Post -Uri "$base/scheduling/run" | ConvertTo-Json -Depth 5
-Invoke-RestMethod "$base/workers/$($worker.id)/jobs" | ConvertTo-Json -Depth 5
+Start-Sleep -Seconds 5
+Post-Json "/workers/$($oldWorker.id)/heartbeat" | Out-Null
+Post-Json '/scheduling/run' | ConvertTo-Json -Depth 5
+$oldClaim = @{ attempt_number = 2; claim_id = [guid]::NewGuid().ToString() }
+Post-Json "/workers/$($oldWorker.id)/heartbeat" | Out-Null
+Post-Json "/workers/$($oldWorker.id)/jobs/$($job.id)/claim" $oldClaim | Format-List
+Start-Sleep -Seconds 31
+Post-Json '/jobs/recover' | ConvertTo-Json -Depth 5
 ```
 
-Expect one assignment. Refresh the heartbeat immediately before claiming so typing
-delays do not exceed 15 seconds. Generate one claim UUID and preserve it for retries:
+Attempt 2 is expired; the next delay is 10 seconds. Register another worker after that
+delay; the first worker is stale, so attempt 3 will go to the new worker:
 
 ```powershell
-$claimId = [guid]::NewGuid().ToString()
-$claimBody = @{ claim_id = $claimId } | ConvertTo-Json
-Invoke-RestMethod -Method Post -Uri "$base/workers/$($worker.id)/heartbeat" | Out-Null
-Invoke-RestMethod -Method Post -Uri "$base/workers/$($worker.id)/jobs/$($job.id)/claim" -ContentType 'application/json' -Body $claimBody | Format-List
-```
-
-Report simulated completion and repeat the identical report to confirm idempotency:
-
-```powershell
-$reportBody = @{ claim_id = $claimId; outcome = "completed"; result = @{ simulated = $true } } | ConvertTo-Json -Depth 5
-Invoke-RestMethod -Method Post -Uri "$base/workers/$($worker.id)/jobs/$($job.id)/report" -ContentType 'application/json' -Body $reportBody | Format-List
-Invoke-RestMethod -Method Post -Uri "$base/workers/$($worker.id)/jobs/$($job.id)/report" -ContentType 'application/json' -Body $reportBody | Format-List
-Invoke-RestMethod "$base/jobs/$($job.id)" | Format-List
+Start-Sleep -Seconds 10
+$newWorker = Post-Json '/workers/register' @{ identity = 'new-worker' }
+Post-Json '/scheduling/run' | ConvertTo-Json -Depth 5
+# Expected 409: the old owner cannot complete the new attempt.
+try {
+    Post-Json "/workers/$($oldWorker.id)/jobs/$($job.id)/report" (@{} + $oldClaim + @{ outcome = 'completed'; result = @{ simulated = $true } })
+} catch {
+    $_.Exception.Response.StatusCode
+    $_.ErrorDetails.Message
+}
+$newClaim = @{ attempt_number = 3; claim_id = [guid]::NewGuid().ToString() }
+Post-Json "/workers/$($newWorker.id)/heartbeat" | Out-Null
+Post-Json "/workers/$($newWorker.id)/jobs/$($job.id)/claim" $newClaim | Format-List
+Post-Json "/workers/$($newWorker.id)/jobs/$($job.id)/report" (@{} + $newClaim + @{ outcome = 'completed'; result = @{ simulated = $true } }) | Format-List
+Invoke-RestMethod "$base/jobs/$($job.id)/attempts" | Format-Table
 Invoke-RestMethod "$base/deployments" | Format-Table id, runtime_status
 ```
 
-Expect job `completed` and deployment `pending`. A different claim UUID or contradictory
-report returns 409. Reporting a failed outcome on a newly claimed job instead requires
-`{"claim_id":"<UUID>","outcome":"failed","error":"simulated failure"}`.
+Expect expired attempts 1 and 2, completed attempt 3, and deployment runtime `pending`.
+If typing takes more than 15 seconds between scheduling and claiming, the assignment
+will expire; run each scheduling/claim sequence promptly.
 
-To exercise automatic simulation, create and assign another deployment in terminal 2,
-then start the agent with the same worker identity:
-
-```powershell
-$nextDeployment = Invoke-RestMethod -Method Post -Uri "$base/applications/$($application.id)/deployments" -ContentType 'application/json' -Body '{"specification":{"image":"demo:v2"}}'
-Invoke-RestMethod -Method Post -Uri "$base/workers/$($worker.id)/heartbeat" | Out-Null
-Invoke-RestMethod -Method Post -Uri "$base/scheduling/run" | ConvertTo-Json -Depth 5
-.\.venv\Scripts\python.exe -m backend.worker.agent --identity job-demo-worker --heartbeat-interval 5 --poll-jobs
-```
-
-After the worker logs simulated completion, stop it with Ctrl+C and inspect:
+Create another job and exhaust its three assignments without claiming any of them:
 
 ```powershell
-Invoke-RestMethod "$base/jobs?deployment_id=$($nextDeployment.id)" | Format-List
-Invoke-RestMethod "$base/deployments" | Format-Table id, runtime_status
+$exhausted = New-DemoJob
+foreach ($number in 1..3) {
+    Post-Json "/workers/$($newWorker.id)/heartbeat" | Out-Null
+    Post-Json '/scheduling/run' | ConvertTo-Json -Depth 5
+    Start-Sleep -Seconds 16
+    Post-Json '/jobs/recover' | ConvertTo-Json -Depth 5
+    if ($number -lt 3) { Start-Sleep -Seconds (5 * [math]::Pow(2, $number - 1)) }
+}
+Invoke-RestMethod "$base/jobs/$($exhausted.id)" | Format-List
+Invoke-RestMethod "$base/jobs/$($exhausted.id)/attempts" | Format-Table
 ```
 
-The new job should be completed, with both deployments still pending. To return the
-API to its normal database later, stop it and run `Remove-Item Env:MINI_CLOUD_DATABASE_PATH`
-in terminal 1 before restarting it. The manual-test database remains safely ignored.
+Expect `state=failed`, `attempt_count=3`, and `last_failure_code=attempts_exhausted`.
+The fixed simulated worker completes too quickly for an interactive kill reliably;
+manual claim requests above provide deterministic fault injection without adding a
+fake long-running application executor.
+
+Run all automated checks:
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest -q
+```
+
+Tests cover exact deadlines, heartbeat/lease independence, renewable ownership,
+out-of-order renewal retries, bounded delays and exhaustion, stale generations,
+concurrent scheduler/recovery/renewal/report races, historical receipts across restarts,
+transaction rollback, v2 upgrades with grace windows and terminal receipts, process
+restarts, API outages, and lease loss in the HTTP-only agent. No real sleeps or network
+services are required by these tests.
+
+The final engineering review adds a complete HTTP two-worker recovery regression:
+the first claim expires, recovery releases it, the second worker claims the retry,
+the stale owner gets 409, and the second completes with both attempts preserved and
+the deployment still pending. A separate regression verifies that a new claim resets
+renewal backoff accumulated by a previous attempt.

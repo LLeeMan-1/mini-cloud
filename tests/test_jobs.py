@@ -58,21 +58,22 @@ def test_creation_poll_claim_complete_and_idempotent_retries(client, clock):
     assignments = client.get(f"/workers/{node['id']}/jobs").json()
     assert assignments == [{"id": job["id"], "deployment_id": dep["id"],
                             "kind": "prepare_deployment", "state": "assigned",
-                            "specification": dep["specification"]}]
+                            "specification": dep["specification"], "attempt_number": 1,
+                            "assignment_expires_at": job["assignment_expires_at"]}]
     token = str(uuid4())
-    claim = client.post(prefix + "/claim", json={"claim_id": token})
+    claim = client.post(prefix + "/claim", json={"attempt_number": 1, "claim_id": token})
     assert claim.status_code == 200
     assert claim.json()["state"] == "claimed"
-    assert client.post(prefix + "/claim", json={"claim_id": token}).json() == claim.json()
+    assert client.post(prefix + "/claim", json={"attempt_number": 1, "claim_id": token}).json() == claim.json()
     assert client.get(f"/workers/{node['id']}/jobs").json() == []
-    report = {"claim_id": token, "outcome": "completed", "result": {"simulated": True}}
+    report = {"attempt_number": 1, "claim_id": token, "outcome": "completed", "result": {"simulated": True}}
     completed = client.post(prefix + "/report", json=report)
     assert completed.status_code == 200
     assert completed.json()["state"] == "completed"
     assert client.post(prefix + "/report", json=report).json() == completed.json()
-    assert client.post(prefix + "/claim", json={"claim_id": token}).json() == completed.json()
+    assert client.post(prefix + "/claim", json={"attempt_number": 1, "claim_id": token}).status_code == 409
     assert client.get("/deployments").json() == [dep]
-    assert client.get(f"/jobs/{job['id']}").json() == completed.json()
+    assert client.get(f"/jobs/{job['id']}").json() == {k: v for k, v in completed.json().items() if k not in ("acknowledged_attempt_number", "attempt_outcome")}
     for field in ("created_at", "assigned_at", "claimed_at", "finished_at"):
         assert datetime.fromisoformat(completed.json()[field]).tzinfo is not None
 
@@ -112,11 +113,11 @@ def test_scheduler_fifo_tiebreak_limits_capacity_and_no_automatic_runs(client, c
     assert all(job["state"] == "queued" for job in client.get("/jobs").json())
     # Force equal creation timestamps to test the ID tie breaker.
     with client.app.state.engine.begin() as connection:
-        connection.execute(text("UPDATE jobs SET created_at = '2026-10-20 00:00:00.000000'"))
+        connection.execute(text("UPDATE jobs SET created_at = '2026-10-20 00:00:00.000000', next_run_at = '2026-10-20 00:00:00.000000'"))
     assert client.post("/scheduling/run?limit=1").json()["assignments"] == [
-        {"job_id": get_job(client, deps[0]["id"])["id"], "worker_id": nodes[0]["id"]}]
+        {"job_id": get_job(client, deps[0]["id"])["id"], "worker_id": nodes[0]["id"], "attempt_number": 1}]
     assert client.post("/scheduling/run").json()["assignments"] == [
-        {"job_id": get_job(client, deps[1]["id"])["id"], "worker_id": nodes[1]["id"]}]
+        {"job_id": get_job(client, deps[1]["id"])["id"], "worker_id": nodes[1]["id"], "attempt_number": 1}]
     assert client.post("/scheduling/run").json()["assigned_count"] == 0
     assert get_job(client, deps[2]["id"])["state"] == "queued"
 
@@ -173,7 +174,7 @@ def test_atomic_concurrent_claims(client, clock, same_claim):
     if same_claim:
         tokens = [tokens[0]] * 4
     with ThreadPoolExecutor(max_workers=4) as executor:
-        responses = list(executor.map(lambda token: client.post(prefix + "/claim", json={"claim_id": token}), tokens))
+        responses = list(executor.map(lambda token: client.post(prefix + "/claim", json={"attempt_number": 1, "claim_id": token}), tokens))
     assert [response.status_code for response in responses].count(200) == (4 if same_claim else 1)
     assert all(response.status_code in (200, 409) for response in responses)
     accepted = [response.json() for response in responses if response.status_code == 200]
@@ -185,14 +186,14 @@ def test_wrong_owners_invalid_states_and_contradictory_reports(client, clock):
     other = worker(client, "other")
     wrong = f"/workers/{other['id']}/jobs/{job['id']}"
     token = str(uuid4())
-    claim = {"claim_id": token}
+    claim = {"attempt_number": 1, "claim_id": token}
     report = {**claim, "outcome": "completed", "result": {"simulated": True}}
     assert client.post(wrong + "/claim", json=claim).status_code == 409
     assert client.post(prefix + "/report", json=report).status_code == 409
     assert client.post(prefix + "/claim", json=claim).status_code == 200
-    assert client.post(prefix + "/claim", json={"claim_id": str(uuid4())}).status_code == 409
+    assert client.post(prefix + "/claim", json={"attempt_number": 1, "claim_id": str(uuid4())}).status_code == 409
     assert client.post(wrong + "/report", json=report).status_code == 409
-    assert client.post(prefix + "/report", json={**report, "claim_id": str(uuid4())}).status_code == 409
+    assert client.post(prefix + "/report", json={**report, "attempt_number": 1, "claim_id": str(uuid4())}).status_code == 409
     assert client.post(prefix + "/report", json=report).status_code == 200
     assert client.post(prefix + "/report", json={**report, "result": {"changed": True}}).status_code == 409
     assert client.post(prefix + "/report", json={**claim, "outcome": "failed", "error": "different"}).status_code == 409
@@ -201,35 +202,33 @@ def test_wrong_owners_invalid_states_and_contradictory_reports(client, clock):
 def test_failed_simulation_is_terminal_and_does_not_change_runtime(client, clock):
     dep, _, _, prefix = assigned(client)
     token = str(uuid4())
-    client.post(prefix + "/claim", json={"claim_id": token})
-    report = {"claim_id": token, "outcome": "failed", "error": "simulated failure"}
+    client.post(prefix + "/claim", json={"attempt_number": 1, "claim_id": token})
+    report = {"attempt_number": 1, "claim_id": token, "outcome": "failed", "error": "simulated failure"}
     first = client.post(prefix + "/report", json=report)
     assert first.status_code == 200 and first.json()["state"] == "failed"
     assert client.post(prefix + "/report", json=report).json() == first.json()
     assert client.get("/deployments").json() == [dep]
 
 
-def test_expired_worker_cannot_claim_but_owner_can_retry_and_report(client, clock):
-    _, node, job, prefix = assigned(client)
-    clock[0] += timedelta(seconds=16)
+def test_expired_heartbeat_does_not_revoke_live_claim(client, clock):
+    _, _, _, prefix = assigned(client)
     token = str(uuid4())
-    assert client.post(prefix + "/claim", json={"claim_id": token}).status_code == 409
-    client.post(f"/workers/{node['id']}/heartbeat")
-    assert client.post(prefix + "/claim", json={"claim_id": token}).status_code == 200
-    clock[0] += timedelta(seconds=60)
-    assert client.post(prefix + "/claim", json={"claim_id": token}).status_code == 200
-    assert client.post(prefix + "/report", json={"claim_id": token, "outcome": "completed"}).status_code == 200
+    body = {"attempt_number": 1, "claim_id": token}
+    assert client.post(prefix + "/claim", json=body).status_code == 200
+    clock[0] += timedelta(seconds=16)
+    assert client.post(prefix + "/claim", json=body).status_code == 200
+    assert client.post(prefix + "/report", json={**body, "outcome": "completed"}).status_code == 200
 
 
 @pytest.mark.parametrize("claimed", [False, True])
-def test_disappeared_worker_keeps_reserved_job(client, clock, claimed):
+def test_scheduler_recovers_disappeared_worker_job(client, clock, claimed):
     _, _, job, prefix = assigned(client)
     if claimed:
-        client.post(prefix + "/claim", json={"claim_id": str(uuid4())})
+        client.post(prefix + "/claim", json={"attempt_number": 1, "claim_id": str(uuid4())})
     clock[0] += timedelta(seconds=100)
     worker(client, "replacement")
     assert client.post("/scheduling/run").json()["assigned_count"] == 0
-    assert client.get(f"/jobs/{job['id']}").json()["state"] == ("claimed" if claimed else "assigned")
+    assert client.get(f"/jobs/{job['id']}").json()["state"] == "queued"
 
 
 def test_active_capacity_constraint_and_transition_trigger(client, clock):
@@ -237,15 +236,15 @@ def test_active_capacity_constraint_and_transition_trigger(client, clock):
     second = get_job(client, deployment(client)["id"])
     with client.app.state.engine.begin() as connection:
         with pytest.raises(IntegrityError, match="UNIQUE"):
-            connection.execute(text("UPDATE jobs SET state='assigned', worker_id=:worker, assigned_at=:now WHERE id=:job"),
+            connection.execute(text("UPDATE jobs SET state='assigned', worker_id=:worker, assigned_at=:now, assignment_expires_at=:now, attempt_count=1 WHERE id=:job"),
                                {"worker": node["id"], "now": "2026-10-20 00:00:00.000000", "job": second["id"]})
     with client.app.state.engine.begin() as connection:
         with pytest.raises(IntegrityError, match="invalid job state transition"):
-            connection.execute(text("UPDATE jobs SET state='queued' WHERE id=:job"), {"job": job["id"]})
+            connection.execute(text("UPDATE jobs SET state='completed' WHERE id=:job"), {"job": job["id"]})
 
 
 @pytest.mark.parametrize("body", [
-    {}, {"claim_id": "bad", "outcome": "completed"},
+    {}, {"attempt_number": 1, "claim_id": "bad", "outcome": "completed"},
     {"outcome": "queued"}, {"outcome": "failed"},
     {"outcome": "failed", "error": " "},
     {"outcome": "completed", "error": "wrong"},
@@ -253,14 +252,14 @@ def test_active_capacity_constraint_and_transition_trigger(client, clock):
     {"outcome": "completed", "extra": True},
 ])
 def test_invalid_reports(client, body):
-    body = {"claim_id": str(uuid4()), **body}
+    body = {"attempt_number": 1, "claim_id": str(uuid4()), **body}
     assert client.post("/workers/1/jobs/1/report", json=body).status_code == 422
 
 
 def test_missing_records_and_invalid_filters(client):
     assert client.get("/jobs/999").status_code == 404
     assert client.get("/workers/999/jobs").status_code == 404
-    assert client.post("/workers/999/jobs/999/claim", json={"claim_id": str(uuid4())}).status_code == 404
+    assert client.post("/workers/999/jobs/999/claim", json={"attempt_number": 1, "claim_id": str(uuid4())}).status_code == 404
     for path in ("/jobs?state=bad", "/jobs?worker_id=0", "/jobs?limit=101", "/jobs?offset=-1"):
         assert client.get(path).status_code == 422
     assert client.post("/scheduling/run?limit=101").status_code == 422
@@ -269,12 +268,12 @@ def test_missing_records_and_invalid_filters(client):
 def test_claim_id_cannot_be_reused_for_a_different_job(client, clock):
     _, _, _, prefix = assigned(client)
     token = str(uuid4())
-    client.post(prefix + "/claim", json={"claim_id": token})
-    client.post(prefix + "/report", json={"claim_id": token, "outcome": "completed"})
+    client.post(prefix + "/claim", json={"attempt_number": 1, "claim_id": token})
+    client.post(prefix + "/report", json={"attempt_number": 1, "claim_id": token, "outcome": "completed"})
     dep = deployment(client)
     client.post("/scheduling/run")
     next_job = get_job(client, dep["id"])
-    response = client.post(f"/workers/{next_job['worker_id']}/jobs/{next_job['id']}/claim", json={"claim_id": token})
+    response = client.post(f"/workers/{next_job['worker_id']}/jobs/{next_job['id']}/claim", json={"attempt_number": 1, "claim_id": token})
     assert response.status_code == 409
 
 
@@ -283,10 +282,12 @@ def test_state_survives_restart_and_lost_claim_response(tmp_path):
     token = str(uuid4())
     with TestClient(create_app(path)) as first:
         dep, _, job, prefix = assigned(first)
-        claim = first.post(prefix + "/claim", json={"claim_id": token}).json()
+        claim = first.post(prefix + "/claim", json={"attempt_number": 1, "claim_id": token}).json()
     with TestClient(create_app(path)) as second:
-        assert second.post(prefix + "/claim", json={"claim_id": token}).json() == claim
-        report = {"claim_id": token, "outcome": "completed", "result": {"simulated": True}}
+        replay = second.post(prefix + "/claim", json={"attempt_number": 1, "claim_id": token})
+        assert replay.status_code == 200
+        assert replay.json()["lease_expires_at"] == claim["lease_expires_at"]
+        report = {"attempt_number": 1, "claim_id": token, "outcome": "completed", "result": {"simulated": True}}
         assert second.post(prefix + "/report", json=report).status_code == 200
         assert second.get("/deployments").json() == [dep]
 
@@ -297,8 +298,8 @@ def test_queued_job_cannot_be_claimed_or_reported(client, clock):
     job = get_job(client, dep["id"])
     prefix = f"/workers/{node['id']}/jobs/{job['id']}"
     token = str(uuid4())
-    assert client.post(prefix + "/claim", json={"claim_id": token}).status_code == 409
-    assert client.post(prefix + "/report", json={"claim_id": token, "outcome": "completed"}).status_code == 409
+    assert client.post(prefix + "/claim", json={"attempt_number": 1, "claim_id": token}).status_code == 409
+    assert client.post(prefix + "/report", json={"attempt_number": 1, "claim_id": token, "outcome": "completed"}).status_code == 409
     assert client.get(f"/jobs/{job['id']}").json()["state"] == "queued"
 
 
@@ -307,14 +308,14 @@ def test_ownership_write_failure_rolls_back_and_allows_retry(client, clock, oper
     dep, _, job, prefix = assigned(client)
     token = str(uuid4())
     if operation == "report":
-        assert client.post(prefix + "/claim", json={"claim_id": token}).status_code == 200
+        assert client.post(prefix + "/claim", json={"attempt_number": 1, "claim_id": token}).status_code == 200
     before = client.get(f"/jobs/{job['id']}").json()
 
     def fail_after_update(connection, cursor, statement, parameters, context, executemany):
         if statement.startswith("UPDATE jobs"):
             raise RuntimeError("Failure after ownership update")
 
-    payload = {"claim_id": token}
+    payload = {"attempt_number": 1, "claim_id": token}
     if operation == "report":
         payload["outcome"] = "completed"
     event.listen(client.app.state.engine, "after_cursor_execute", fail_after_update)
@@ -332,10 +333,10 @@ def test_ownership_write_failure_rolls_back_and_allows_retry(client, clock, oper
 def test_concurrent_reports_are_idempotent_or_conflict(client, clock, same_outcome):
     _, _, job, prefix = assigned(client)
     token = str(uuid4())
-    client.post(prefix + "/claim", json={"claim_id": token})
+    client.post(prefix + "/claim", json={"attempt_number": 1, "claim_id": token})
     reports = [
-        {"claim_id": token, "outcome": "completed", "result": {"simulated": True}},
-        {"claim_id": token, "outcome": "failed", "error": "simulated failure"},
+        {"attempt_number": 1, "claim_id": token, "outcome": "completed", "result": {"simulated": True}},
+        {"attempt_number": 1, "claim_id": token, "outcome": "failed", "error": "simulated failure"},
     ]
     if same_outcome:
         reports[1] = reports[0]
@@ -348,12 +349,12 @@ def test_concurrent_reports_are_idempotent_or_conflict(client, clock, same_outco
 
 def test_database_capacity_includes_claimed_jobs(client, clock):
     _, node, _, prefix = assigned(client)
-    client.post(prefix + "/claim", json={"claim_id": str(uuid4())})
+    client.post(prefix + "/claim", json={"attempt_number": 1, "claim_id": str(uuid4())})
     second = get_job(client, deployment(client)["id"])
     assert client.post("/scheduling/run").json()["assigned_count"] == 0
     with client.app.state.engine.begin() as connection:
         with pytest.raises(IntegrityError, match="UNIQUE"):
-            connection.execute(text("UPDATE jobs SET state='assigned', worker_id=:worker, assigned_at=:now WHERE id=:job"),
+            connection.execute(text("UPDATE jobs SET state='assigned', worker_id=:worker, assigned_at=:now, assignment_expires_at=:now, attempt_count=1 WHERE id=:job"),
                                {"worker": node["id"], "now": "2026-10-20 00:00:00.000000", "job": second["id"]})
 
 
@@ -362,7 +363,7 @@ def test_fifo_prefers_creation_time_before_job_id(client, clock):
     second = get_job(client, deployment(client)["id"])
     worker(client)
     with client.app.state.engine.begin() as connection:
-        connection.execute(text("UPDATE jobs SET created_at='2020-01-01 00:00:00.000000' WHERE id=:id"), {"id": second["id"]})
+        connection.execute(text("UPDATE jobs SET created_at='2020-01-01 00:00:00.000000', next_run_at='2020-01-01 00:00:00.000000' WHERE id=:id"), {"id": second["id"]})
     assignment = client.post("/scheduling/run").json()["assignments"][0]
     assert assignment["job_id"] == second["id"]
     assert client.get(f"/jobs/{first['id']}").json()["state"] == "queued"
