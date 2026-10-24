@@ -35,9 +35,10 @@ def translate_error(error: Exception) -> HTTPException:
 def run_scheduler(
     session: DatabaseSession, request: Request, clock: ServerClock,
     limit: Annotated[int, Query(ge=1, le=100)] = 100,
+    recover_expired: bool = True,
 ):
     assignments = scheduling.schedule_jobs(session, request.app.state.worker_timeout, limit, clock,
-                                           request.app.state.job_policy)
+                                           request.app.state.job_policy, recover_expired=recover_expired)
     return {"assigned_count": len(assignments), "assignments": assignments}
 
 

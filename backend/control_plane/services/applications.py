@@ -4,7 +4,7 @@ from copy import deepcopy
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session
 
 from backend.control_plane.persistence.models import Application, Deployment, DeploymentTarget, Job, utc_now
@@ -53,3 +53,16 @@ def create_deployment(
 
 def list_deployments(session: Session) -> list[Deployment]:
     return list(session.scalars(select(Deployment).order_by(Deployment.id)))
+
+
+def discover_deployments(session, limit, after_id, through_id=None):
+    """A bounded membership scan, not a snapshot of mutable deployment targets."""
+    with session.begin():
+        session.execute(text("BEGIN"))
+        boundary = through_id if through_id is not None else session.scalar(
+            select(func.coalesce(func.max(Deployment.id), 0)))
+        ids = list(session.scalars(select(Deployment.id).where(
+            Deployment.id > after_id, Deployment.id <= boundary).order_by(Deployment.id).limit(limit + 1)))
+        page = ids[:limit]
+        return {"items": [{"id": value} for value in page], "snapshot_max_id": boundary,
+                "next_after_id": page[-1] if len(ids) > limit else None}

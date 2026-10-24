@@ -7,12 +7,13 @@ from backend.control_plane.services import instances
 from backend.control_plane.job_policy import JobPolicy
 
 
-def schedule_jobs(session, timeout, limit=100, clock=utc_now, policy=None):
+def schedule_jobs(session, timeout, limit=100, clock=utc_now, policy=None, *, recover_expired=True):
     policy = policy or JobPolicy()
     assignments = []
     with write_transaction(session):
         now = clock()
-        recover_in_transaction(session, now, policy, limit)
+        if recover_expired:
+            recover_in_transaction(session, now, policy, limit)
         busy = select(Job.worker_id).where(Job.state.in_(("assigned", "claimed")))
         workers = list(session.scalars(select(Worker).where(
             Worker.last_heartbeat_at >= now - timedelta(seconds=timeout), ~Worker.id.in_(busy)

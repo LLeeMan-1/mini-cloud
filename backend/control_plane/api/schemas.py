@@ -54,6 +54,16 @@ class DeploymentRead(StoredRecord):
     runtime_status: Literal["pending", "starting", "healthy", "failed", "stopped"]
 
 
+class DeploymentDiscoveryItem(BaseModel):
+    id: int
+
+
+class DeploymentPage(BaseModel):
+    items: list[DeploymentDiscoveryItem]
+    snapshot_max_id: int
+    next_after_id: int | None
+
+
 class WorkerRegister(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

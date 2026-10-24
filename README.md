@@ -7,7 +7,8 @@ jobs, explicit basic scheduling, and opt-in simulated job processing. Milestone 
 adds numbered attempts, leases, retries, and explicit failure recovery. Milestone 1D-A
 adds explicit simulated instance records and lifecycle management. Milestone 1D-B1
 adds replica targets and explicit desired-state reconciliation. Milestone 1D-B2-A
-adds replacement generations, conservative failure policies, and administrative receipts. Docker,
+adds replacement generations, conservative failure policies, and administrative receipts.
+Milestone 1D-B2-B adds an independent HTTP convergence controller. Docker,
 application execution, and the frontend are future milestones.
 
 ## Windows PowerShell setup
@@ -110,10 +111,11 @@ with an error for operator correction. There is no retry limit for transient err
 | GET | `/applications` | List applications in ID order. |
 | POST | `/applications/{id}/deployments` | Create a pending deployment; returns 201, or 404 for an unknown application. |
 | GET | `/deployments` | List deployments in ID order. |
+| GET | `/deployments/page` | ID-only keyset discovery with a fixed scan upper bound. |
 | POST | `/workers/register` | Register or refresh a worker by identity; returns 200. |
 | POST | `/workers/{id}/heartbeat` | Refresh a known worker; returns 200, or 404 for an unknown worker. |
 | GET | `/workers` | List workers in ID order with calculated availability. |
-| POST | `/scheduling/run` | Recover expired work, then explicitly assign up to 100 ready jobs; optional `limit=1..100`. |
+| POST | `/scheduling/run` | Assign up to 100 ready jobs; `limit=1..100`, `recover_expired=true` by default. |
 | GET | `/jobs` | List jobs; filters: `state`, `deployment_id`, `worker_id`; `limit=1..100`, `offset>=0`. |
 | GET | `/jobs/{id}` | Return one durable job. |
 | GET | `/workers/{id}/jobs` | Poll this worker's assigned jobs, including immutable specifications. |
@@ -209,6 +211,10 @@ backend/control_plane/
 backend/worker/
   agent.py                 Separate HTTP client process and retry loop
   jobs.py                  Opt-in HTTP polling and fixed simulation handler
+backend/controller/
+  agent.py                 Independent CLI, signal handling, and logging setup
+  client.py                Loopback HTTP client and response validation
+  convergence.py           One orchestration cycle and synchronous retry loop
 tests/                     API validation and persistence tests
 var/                       Ignored runtime data
 ```
@@ -1119,6 +1125,194 @@ Post-Json "/instances/$terminalId/replace" $request | ConvertTo-Json -Depth 10
 Invoke-RestMethod "$base/deployments/$($dep.id)/replicas" | ConvertTo-Json -Depth 12
 ```
 
-B2-B's separate convergence controller is not implemented. There is no scale-down,
+The B2-B controller described below invokes these same operations; it does not
+change replacement eligibility or budgets. There is no scale-down,
 active-job cancellation, force replacement of healthy/active work, real health
 monitor, Docker, or actual application execution.
+
+## Automatic convergence controller (1D-B2-B)
+
+The controller is a separate, synchronous Python process. It imports no persistence
+models, reads no SQLite files, and uses only the existing httpx dependency plus
+standard-library helpers. FastAPI startup does not launch it. Run one controller
+normally; accidentally running two remains safe through existing API transactions,
+uniqueness constraints, generation fencing, and persisted budgets. There is no
+leader election or controller-specific table. Database schema version remains 6.
+
+```powershell
+.\.venv\Scripts\python.exe -m backend.controller.agent --api-url http://127.0.0.1:8000 --interval 5 --request-timeout 5 --page-size 100
+# One diagnostic cycle, without a repeated loop:
+.\.venv\Scripts\python.exe -m backend.controller.agent --api-url http://127.0.0.1:8000 --once
+```
+
+Intervals/timeouts must be finite and positive; page size is 1 through 100. Only
+HTTP loopback destinations are accepted (127.0.0.1, localhost, or an IPv6 loopback
+address). Credentials, base-URL paths, query strings, and fragments are rejected.
+Redirect following and environment-proxy inheritance are disabled. Timeout applies
+to individual HTTP phases; it is not an overall cycle-duration limit.
+
+### Discovery API and cycle ordering
+
+The existing `GET /deployments` array response is unchanged. The new ID-only endpoint:
+
+```text
+GET /deployments/page?limit=100&after_id=0
+```
+
+returns, for example:
+
+```json
+{
+  "items": [{"id": 1}, {"id": 2}],
+  "snapshot_max_id": 42,
+  "next_after_id": 2
+}
+```
+
+Continuation supplies `through_id=42` and `after_id=2`. The server orders IDs
+ascending, fetches one extra row to determine continuation, and captures the first
+page/max-ID in one read transaction. The last page has `next_after_id=null`.
+An empty database returns items=[], snapshot_max_id=0, next_after_id=null.
+`limit` must be 1..100; IDs/bounds must be nonnegative. A nonzero `after_id`
+requires `through_id`, and after_id cannot exceed through_id (422 otherwise).
+
+New deployments above the captured maximum wait until the next cycle. Target changes
+are read at reconciliation time; the discovery boundary is not a snapshot of all
+deployment state. The controller rejects noninteger/Boolean IDs, duplicates,
+out-of-order IDs, changed/out-of-range bounds, oversized pages, nonadvancing cursors,
+and premature end-of-scan responses. It aborts rather than guessing another cursor.
+External SQL deletion/reuse of IDs during discovery is unsupported and may trigger
+this fail-closed validation. Existing APIs do not delete deployments.
+
+Each cycle performs:
+
+1. POST `/jobs/recover?limit=100` once.
+2. Discover a page and POST `/deployments/{id}/reconcile` for each ID.
+3. Continue discovery up to the captured boundary.
+4. POST `/scheduling/run?limit=100&recover_expired=false` once.
+
+The optional scheduling flag defaults to true, preserving every existing caller.
+False skips only the scheduler's embedded recovery; worker eligibility and
+assignment remain in the same short SQLite write transaction. Jobs expiring after
+the recovery stage can wait until the next cycle. Large recovery/assignment
+backlogs advance in batches across cycles, without unbounded drain loops. The
+controller never holds a transaction across HTTP operations.
+
+### Failures, outcomes, and shutdown
+
+Cycle outcomes are `success`, `degraded`, and `aborted`:
+
+| Condition | Behavior |
+| --- | --- |
+| Deployment 409 or structured deployment-not-found 404 | Count failed, log code, continue with other deployments and scheduling; degraded. |
+| One deployment 5xx or malformed reconciliation acknowledgment | Isolate the failure and continue; degraded. |
+| Three consecutive deployment server failures | Abort as likely global failure; back off. |
+| Connection error, timeout, 408, 429, or 503 | Abort; no immediate uncertain mutation retry. |
+| Malformed recovery/discovery/scheduling response | Abort; no guessed cursor or false successful counts. |
+| Unexpected 4xx, redirect, or missing required endpoint | Fatal incompatibility/configuration; exit nonzero. |
+
+Numeric `Retry-After` is clamped to 0..30 seconds. Global failure delays grow
+1, 2, 4, 8, 16, 30 seconds, bounded at 30, with the actual wait never shorter than
+the configured interval. A cycle without global availability failure resets this
+backoff; deployment-specific conflicts do not penalize healthy deployments.
+Non-numeric Retry-After values fall back to normal backoff.
+
+A timed-out mutation may have committed. Its result is logged as unknown, and the
+next cycle rediscovers durable state. The controller never deletes records, resets
+budgets, or issues compensating administrative replacements. Completed responses
+are validated before their counts are trusted.
+
+One synchronous cycle runs at a time. The next due time is monotonic completion
+time plus interval/backoff, with no catch-up ticks or overlapping cycles. A slow
+seven-second cycle followed by a five-second delay starts the next cycle about
+twelve seconds after the previous start. Full scans have no fixed cycle deadline;
+deployment count and request latency determine their duration.
+
+Ctrl+C sets a stop event. An in-flight request can finish or time out, but no new
+operation begins afterward. Interruptible waits wake immediately, the HTTP client
+closes, and `event=controller_stopped` is logged. Server-side work already accepted
+is not canceled. Restart starts a fresh discovery scan without losing orchestration
+state. `--once` exits 0 for success, 1 for degraded/fatal, and 2 for aborted transient
+failure. A requested graceful stop exits 0.
+
+Logs report cycle ID/outcome/duration, deployments seen/reconciled/failed, recovery
+counts, slots created, instances replaced, blocked-reason counts, assignments,
+HTTP failure codes, and next delay. Unchanged reconciliations use DEBUG. Blocked
+reasons are aggregated per deployment. Response bodies, specifications, claim IDs,
+and credentials are not logged. Counts summarize accepted responses and are not a
+globally atomic snapshot across the cycle.
+
+### Manual convergence demonstration
+
+Use five VS Code PowerShell terminals: API, two workers, controller, and a request
+terminal. Choose another free port if 8010 is already occupied. Terminal 1:
+
+```powershell
+Set-Location C:\Projects\mini-cloud-1
+$env:MINI_CLOUD_DATABASE_PATH = Join-Path $PWD ("var\manual-controller-{0}.db" -f [guid]::NewGuid().ToString("N"))
+.\.venv\Scripts\python.exe -m uvicorn backend.control_plane.main:app --host 127.0.0.1 --port 8010
+```
+
+Terminal 2:
+
+```powershell
+Set-Location C:\Projects\mini-cloud-1
+.\.venv\Scripts\python.exe -m backend.worker.agent --identity controller-demo-worker-1 --api-url http://127.0.0.1:8010 --poll-jobs
+```
+
+Terminal 3:
+
+```powershell
+Set-Location C:\Projects\mini-cloud-1
+.\.venv\Scripts\python.exe -m backend.worker.agent --identity controller-demo-worker-2 --api-url http://127.0.0.1:8010 --poll-jobs
+```
+
+Terminal 4:
+
+```powershell
+Set-Location C:\Projects\mini-cloud-1
+.\.venv\Scripts\python.exe -m backend.controller.agent --api-url http://127.0.0.1:8010 --interval 5 --request-timeout 5 --page-size 100
+```
+
+Terminal 5 creates intent and inspects progress; no manual orchestration requests:
+
+```powershell
+$base = 'http://127.0.0.1:8010'
+function Send-Json($method, $path, $body) {
+    Invoke-RestMethod -Method $method -Uri "$base$path" -ContentType 'application/json' -Body ($body | ConvertTo-Json -Depth 10)
+}
+$app = Send-Json Post '/applications' @{ name = 'controller-demo' }
+$dep = Send-Json Post "/applications/$($app.id)/deployments" @{
+    specification = @{ simulated = $true }; desired_replicas = 3
+}
+# Repeat inspection as cycles/workers advance: three current replicas become healthy.
+Invoke-RestMethod "$base/instances?deployment_id=$($dep.id)&current=true" | Format-Table replica_index, generation, state, worker_available
+$target = Invoke-RestMethod "$base/deployments/$($dep.id)/replicas"
+Send-Json Put "/deployments/$($dep.id)/replicas" @{
+    desired_replicas = 4; expected_version = $target.version
+}
+Invoke-RestMethod "$base/deployments/$($dep.id)/replicas" | ConvertTo-Json -Depth 10
+Invoke-RestMethod "$base/deployments" | Format-Table id, runtime_status
+```
+
+Expect exactly one extra slot to converge. Stop/restart the controller and confirm
+no duplicate work. Temporarily stop/restart this isolated API to observe backoff and
+recovery. Run a second controller briefly to verify concurrent invocations. Stop a
+healthy instance with its version-checked endpoint: controllers preserve it as
+blocked. Stop a worker's heartbeats: last-known healthy state remains unchanged.
+Use Ctrl+C to stop each process. Keep real fault injection in disposable databases;
+normal workers simulate successful readiness, so retryable startup failures are
+tested through controlled HTTP worker/test-harness reports rather than new worker
+failure-injection flags.
+
+Unit tests use fake HTTP transports, controlled clocks, and interruptible stop
+events. Integration tests use temporary SQLite databases and real routes; one test
+races real controller CLI processes against a disposable API on an OS-assigned
+loopback port. No development/manual database is used by tests.
+
+This controller provides eventual progress, not continuous health monitoring or
+real execution guarantees. Corrupt global state can still block recovery/scheduling.
+Duplicate controllers can increase SQLite contention even though their decisions
+remain safe. Replacement policies, cooldowns, budgets, generation fencing, and
+historical acknowledgments are unchanged. No schema migration, new dependency,
+leader election, controller table, background FastAPI loop, or new scheduler exists.
