@@ -5,12 +5,12 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import literal, select
 from sqlalchemy.engine import Engine
 
-from backend.control_plane.persistence.models import Application, Deployment, Worker, Job, JobAttempt, JobRenewal, Instance, DeploymentTarget, utc_now
-from backend.control_plane.persistence import schema_v3, schema_v4
+from backend.control_plane.persistence.models import Application, Deployment, Worker, Job, JobAttempt, JobRenewal, Instance, DeploymentTarget, ReplicaSlot, ReplacementReceipt, utc_now
+from backend.control_plane.persistence import schema_v3, schema_v4, schema_v5
 from backend.control_plane.job_policy import JobPolicy
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 
 def create_version_two_jobs(connection):
@@ -93,7 +93,7 @@ def upgrade_instances_v4(connection):
 
 
 def upgrade_replicas_v5(connection, now):
-    DeploymentTarget.__table__.create(connection)
+    schema_v5.create_table(connection, "deployment_targets")
     connection.execute(DeploymentTarget.__table__.insert().from_select(
         ["deployment_id", "desired_replicas", "version", "created_at", "updated_at"],
         select(Deployment.id, literal(1), literal(1),
@@ -103,14 +103,34 @@ def upgrade_replicas_v5(connection, now):
     ))
     connection.exec_driver_sql("CREATE TEMP TABLE v5_instances AS SELECT * FROM instances")
     connection.exec_driver_sql("DROP TABLE instances")
-    Instance.__table__.create(connection)
-    columns = ", ".join(column.name for column in Instance.__table__.columns)
-    restored = ", ".join("0" if column.name == "replica_index" else column.name
-                         for column in Instance.__table__.columns)
+    schema_v5.create_table(connection, "instances")
+    old_columns = [row[1] for row in connection.exec_driver_sql("PRAGMA table_info(instances)")]
+    columns = ", ".join(old_columns)
+    restored = ", ".join("0" if name == "replica_index" else name for name in old_columns)
     connection.exec_driver_sql(f"INSERT INTO instances ({columns}) SELECT {restored} FROM v5_instances")
     connection.exec_driver_sql("DROP TABLE temp.v5_instances")
     if connection.exec_driver_sql("PRAGMA foreign_key_check").all():
         raise RuntimeError("Foreign-key integrity check failed during version 5 migration")
+
+
+def upgrade_generations_v6(connection):
+    connection.exec_driver_sql("CREATE TEMP TABLE v6_instances AS SELECT * FROM instances")
+    connection.exec_driver_sql("DROP TABLE instances")
+    ReplicaSlot.__table__.create(connection)
+    Instance.__table__.create(connection)
+    connection.exec_driver_sql("""
+        INSERT INTO replica_slots (deployment_id,replica_index,current_generation,version,
+            automatic_replacements,replacement_limit,created_at,updated_at)
+        SELECT deployment_id,replica_index,1,1,0,1,created_at,updated_at FROM v6_instances
+    """)
+    columns = ", ".join(column.name for column in Instance.__table__.columns)
+    restored = ", ".join("1" if column.name == "generation" else "'initial'" if column.name == "creation_reason"
+                         else column.name for column in Instance.__table__.columns)
+    connection.exec_driver_sql(f"INSERT INTO instances ({columns}) SELECT {restored} FROM v6_instances")
+    ReplacementReceipt.__table__.create(connection)
+    connection.exec_driver_sql("DROP TABLE temp.v6_instances")
+    if connection.exec_driver_sql("PRAGMA foreign_key_check").all():
+        raise RuntimeError("Foreign-key integrity check failed during version 6 migration")
 
 
 def initialize_database(engine: Engine, policy: JobPolicy | None = None, clock=utc_now) -> None:
@@ -177,6 +197,9 @@ def initialize_database(engine: Engine, policy: JobPolicy | None = None, clock=u
             if version < 5:
                 upgrade_replicas_v5(connection, clock())
                 connection.exec_driver_sql("INSERT INTO schema_migrations (version) VALUES (5)")
+            if version < 6:
+                upgrade_generations_v6(connection)
+                connection.exec_driver_sql("INSERT INTO schema_migrations (version) VALUES (6)")
             connection.commit()
         except BaseException:
             connection.rollback()

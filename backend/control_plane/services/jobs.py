@@ -122,6 +122,7 @@ def claim_job(session, worker_id, job_id, claim_id, timeout, clock=utc_now, *, a
         worker = require_worker(session, worker_id)
         job = get_job(session, job_id)
         now = clock()
+        instances.require_current(session, job)
         attempt = attempt_for(session, job_id, attempt_number)
         if job.attempt_count != attempt_number or job.worker_id != worker_id or attempt.worker_id != worker_id:
             raise JobConflict("Assignment belongs to another generation or worker", "stale_attempt")
@@ -156,6 +157,7 @@ def renew_job(session, worker_id, job_id, number, claim_id, renewal_id, clock=ut
         job = get_job(session, job_id)
         attempt = attempt_for(session, job_id, number)
         now = clock()
+        instances.require_current(session, job)
         check_owner(job, attempt, worker_id, claim_id, now)
         receipt = session.scalar(select(JobRenewal).where(
             JobRenewal.attempt_id == attempt.id, JobRenewal.renewal_id == renewal_id))
@@ -200,6 +202,7 @@ def report_job(session, worker_id, job_id, claim_id, outcome, result, error, clo
             if json.dumps(attempt.report_payload, sort_keys=True) != json.dumps(payload, sort_keys=True):
                 raise JobConflict("Report contradicts accepted outcome", "report_conflict")
             return attempt.report_ack
+        instances.require_current(session, job)
         now = clock()
         check_owner(job, attempt, worker_id, claim_id, now)
         instance = None
@@ -216,11 +219,6 @@ def report_job(session, worker_id, job_id, claim_id, outcome, result, error, clo
         else:
             code = "retryable_failure" if retryable else "permanent_failure"
             close_job(session, job, now, policy, code, error, retryable)
-        ack = {**snapshot(job), "acknowledged_attempt_number": attempt_number, "attempt_outcome": outcome}
-        if instance is not None:
-            view = instances.instance_view(session, instance, now, worker_timeout)
-            ack["instance"] = {key: value.isoformat() if isinstance(value, datetime) else value
-                               for key, value in view.items()}
         # Set all terminal history fields before the single flush; history is immutable afterwards.
         attempt.state = outcome
         attempt.finished_at = now
@@ -229,6 +227,14 @@ def report_job(session, worker_id, job_id, claim_id, outcome, result, error, clo
         attempt.retryable = retryable
         attempt.failure_code = code
         attempt.report_payload = payload
+        ack = {**snapshot(job), "acknowledged_attempt_number": attempt_number, "attempt_outcome": outcome}
+        if instance is not None:
+            # Inspect the pending terminal outcome without flushing an immutable
+            # attempt before its receipt has been attached.
+            with session.no_autoflush:
+                view = instances.instance_view(session, instance, now, worker_timeout)
+            ack["instance"] = {key: value.isoformat() if isinstance(value, datetime) else value
+                               for key, value in view.items()}
         attempt.report_ack = ack
     return ack
 

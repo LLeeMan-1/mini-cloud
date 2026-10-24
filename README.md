@@ -6,7 +6,8 @@ HTTP worker agent, worker registration, and heartbeats. Milestone 1C-A adds pers
 jobs, explicit basic scheduling, and opt-in simulated job processing. Milestone 1C-B
 adds numbered attempts, leases, retries, and explicit failure recovery. Milestone 1D-A
 adds explicit simulated instance records and lifecycle management. Milestone 1D-B1
-adds replica targets and explicit, create-only desired-state reconciliation. Docker,
+adds replica targets and explicit desired-state reconciliation. Milestone 1D-B2-A
+adds replacement generations, conservative failure policies, and administrative receipts. Docker,
 application execution, and the frontend are future milestones.
 
 ## Windows PowerShell setup
@@ -125,9 +126,10 @@ with an error for operator correction. There is no retry limit for transient err
 | GET | `/deployments/{id}/replicas` | Replica target, version, slot counts, missing indexes, and blocked slots. |
 | PUT | `/deployments/{id}/replicas` | Version-checked target increase; no instance creation. |
 | POST | `/deployments/{id}/reconcile` | Explicitly create missing replica slots and startup jobs atomically. |
-| GET | `/instances` | Inspect instances; filters `deployment_id`, `worker_id`, `state`; `limit` and `offset`. |
+| GET | `/instances` | Inspect current/history; filters `deployment_id`, `replica_index`, `generation`, `current`, `worker_id`, `state`; `limit` and `offset`. |
 | GET | `/instances/{uuid}` | Instance state, placement provenance, and derived worker availability. |
 | POST | `/instances/{uuid}/stop` | Version-checked simulated stop after startup work is terminal. |
+| POST | `/instances/{uuid}/replace` | Explicit simulated replacement of a terminal failed/stopped current incarnation; durable request-ID replay. |
 
 Worker registration accepts `{"identity":"laptop-worker-1"}`. Identity is case-sensitive,
 trimmed, and must be a string of 1–100 characters; extra fields return 422. A unique
@@ -751,11 +753,11 @@ may be needed for startup. Scheduling never runs inside the worker or a FastAPI 
 
 ### Boundaries and remaining limitations
 
-One instance per replica slot, one active job per worker, and one startup job per instance
+One current incarnation per replica slot, one active job per worker, and one startup job per instance
 are intentional limits. Healthy instances do not consume active job slots;
 this is not runtime resource accounting. There is no continuous health monitor,
-active-start cancellation, restart of stopped instances, background reconciliation,
-scale-down, or automatic replacement. Those policies need the 1D-B2 design.
+active-start cancellation, restart of the same stopped instance, background reconciliation,
+or scale-down. Replacement creates a distinct incarnation as described below.
 
 Only localhost development is supported; capabilities and claim UUIDs are not worker
 authentication. API fencing cannot prevent stale external side effects once real
@@ -899,8 +901,224 @@ existing stop endpoint with its current version and reconcile again: the stopped
 slot remains blocked and is not replaced. Stop a worker and wait beyond the
 heartbeat timeout: reachability changes while last-known lifecycle state remains.
 
-B2 will define scale-down, cancellation, replacement generations, and unreachable
-worker policies. There is no reconciliation loop, automatic replacement, Docker,
-or real process execution. API fencing does not guarantee exactly-once external
+B2-A extends the B1 create-only reconciler with bounded replacement generations as
+described below. Scale-down and cancellation remain deferred. There is no
+reconciliation loop, Docker, or real process execution. API fencing does not guarantee exactly-once external
 execution. Healthy replicas do not consume startup job slots or imply runtime
 resource capacity; one worker can simulate several startups sequentially.
+
+## Safe replacement and generations (1D-B2-A)
+
+A logical slot is `(deployment_id, replica_index)`. `replica_slots` stores its
+authoritative `current_generation`, optimistic `version`, timestamps, and persisted
+automatic replacement consumption/limit. Instances now have immutable `generation`
+and `creation_reason` (`initial`, `automatic_replacement`, or
+`administrative_replacement`). Each incarnation has a distinct stable UUID and
+startup job. Attempts are retries within that job; attempt numbers do not identify
+replacement generations.
+
+SQLite uniquely constrains deployment/index/generation. Instances reference their
+logical slot; a deferred composite foreign key makes the slot point to an existing
+generation of that exact slot at commit. Slot creation, incarnation/job creation,
+pointer advancement, and budget consumption share `BEGIN IMMEDIATE`. The slot
+update checks its old version/generation and increments them together. Failed
+creation/commit rolls back everything. Historical instance state/version/placement
+and startup history are never rewritten by replacement.
+
+Reconciliation still creates missing slots in ascending order. It additionally
+replaces eligible terminal failures, returning `replaced_count` and `replaced`
+(old/new UUID and generation, new startup-job ID, slot version, reason, simulated).
+`created_count` continues to count new logical slots only. Repeated/concurrent
+calls create one replacement, and an active new incarnation prevents another.
+Recovery and scheduling remain separate existing operations.
+
+### Conservative simulation-only policy
+
+The same read-only classifier drives instance/replica inspection and reconciliation:
+
+| Condition | Policy |
+| --- | --- |
+| Queued, assigned, claimed, or retrying startup | Retain the existing incarnation/job. |
+| Exhausted reported retryable simulated failures, unclaimed assignments, or a mixture of those | Eligible after the cooldown if budget remains. |
+| Any expired claimed attempt anywhere in that incarnation's history | Block: `uncertain_execution`. |
+| Permanent startup failure | Block: `permanent_startup_failure`. |
+| Explicitly stopped | Block: `stopped`; explicit administrative replacement required. |
+| Last-known healthy, even with an unavailable worker | Retain the observation and UUID. |
+| Automatic budget consumed | Block: `automatic_budget_exhausted`. |
+| Inconsistent slot/generation/job/attempt records | 409 `replica_integrity_conflict`; no repairs. |
+
+There is one automatic replacement per logical slot, with a 30-second cooldown
+after eligible terminal job failure. Equality with the eligibility time is eligible.
+Readiness success, API restart, and administrative replacement never reset the
+counter. Each new incarnation gets a new startup job and the existing configured
+attempt budget. Administrators can explicitly authorize further incarnations;
+there is no autonomous unbounded replacement loop.
+
+These rules apply to fixed simulated execution only. A reported readiness failure
+would not prove container termination once real execution exists. Even existing
+same-incarnation retries after claimed lease loss can duplicate external effects.
+Worker heartbeat expiry is reachability uncertainty, never termination evidence.
+API fencing protects control-plane writes, not external processes or side effects.
+Docker will require worker-side durable identity, idempotent operations, cleanup/
+termination acknowledgments, orphan discovery, and suitable external fencing.
+
+### Inspection, ownership, and administrative replacement
+
+`GET /deployments/{id}/replicas` counts only current incarnations. Its `slots` list
+exposes current UUID/job/generation, slot version, budget, and `replacement`
+classification (`status`, `reason`, `eligible_at`, `simulated`).
+`replacement_eligible` includes eligible/cooling-down entries. Reconciliation
+returns cooling-down entries there; completed replacements are in `replaced`.
+
+`GET /instances` includes historical records by default. Use `current=true` or
+`current=false`, `replica_index`, and/or `generation` to inspect specific history.
+Instance responses expose `generation`, `creation_reason`, derived `is_current`,
+`current_generation`, `slot_version`, and classification. The legacy slot-0 creation
+endpoint returns the current slot-0 incarnation without initiating replacement.
+
+New claims, renewals, and unaccepted reports must belong to the current generation,
+in addition to existing job/attempt/worker/claim checks. Stale generations return
+409 `stale_generation`. Identical previously accepted reports return their durable
+acknowledgments before current-generation checks and never reapply transitions.
+Old receipts omit newly introduced fields; validation/exclude-unset preserves their
+original serialized responses. A historical failed incarnation cannot be newly
+stopped; repeating a stop on an already-stopped record remains idempotent.
+
+`POST /instances/{uuid}/replace` accepts:
+
+```json
+{
+  "request_id": "2ca126f2-06a5-49e9-a4e6-d81652a74617",
+  "expected_slot_version": 1,
+  "reason": "Inspected the simulated failure; authorize another incarnation",
+  "acknowledge_simulated_uncertainty": true
+}
+```
+
+It permits only terminal failed/stopped current incarnations. Healthy instances,
+active/retrying jobs, stale versions, and stale generations return structured 409.
+The reason is a trimmed, nonempty string of at most 500 characters. Versions are
+strict positive integers and acknowledgment must be the Boolean true; invalid
+requests return 422. Existing localhost-only development assumptions remain.
+
+The 200 acknowledgment contains request ID, slot identity, previous/new UUID and
+generation, new startup-job ID, slot version, creation reason, and simulated=true.
+`replacement_receipts` persist the normalized request and acknowledgment in the
+same transaction. Identical request-ID replay returns the original acknowledgment,
+including after later replacements; conflicting reuse returns 409
+`replacement_request_conflict`. Receipts cannot be updated or deleted. Manual
+replacement does not consume or reset the automatic counter. Preserve the request
+ID and original payload until a response is confirmed.
+
+### Migration version 6 and verification
+
+Version 5 tables are frozen in `persistence/schema_v5.py`. Migration 6 rebuilds
+instances, labels existing incarnations generation 1 / initial, and creates one
+current slot for each existing deployment/index pair with version 1 and automatic
+consumption 0 / limit 1. It fabricates no instances, jobs, or historical generations.
+Existing instance versions, UUIDs, states, observations, worker placement, jobs,
+attempts, renewals, targets, immutable specifications, and serialized acknowledgments
+remain unchanged. The administrative receipt table starts empty.
+
+The existing migration transaction serializes startups and verifies foreign keys.
+Tests compare old records and serialized HTTP receipts, inject failures at table
+reconstruction/reference restoration/version recording, and check repeated and
+concurrent startup. All migration tests use temporary databases. Stop old API and
+worker processes before upgrading a selected database; never delete/reset it.
+No migration library or other dependency was added.
+
+### Manual replacement demonstration
+
+Start a fresh isolated API in Terminal 1 (use another free port if needed):
+
+```powershell
+Set-Location C:\Projects\mini-cloud-1
+$env:MINI_CLOUD_DATABASE_PATH = Join-Path $PWD ("var\manual-1db2a-{0}.db" -f [guid]::NewGuid().ToString("N"))
+.\.venv\Scripts\python.exe -m uvicorn backend.control_plane.main:app --host 127.0.0.1 --port 8000
+```
+
+Terminal 2 simulates three reported retryable failures through HTTP. This script
+assumes the default three-attempt policy, 5/10-second retry delays, and 30-second cooldown:
+
+```powershell
+Set-Location C:\Projects\mini-cloud-1
+$base = 'http://127.0.0.1:8000'
+function Post-Json($path, $body = $null) {
+    $options = @{ Method = 'Post'; Uri = "$base$path" }
+    if ($null -ne $body) {
+        $options.ContentType = 'application/json'
+        $options.Body = $body | ConvertTo-Json -Depth 20
+    }
+    Invoke-RestMethod @options
+}
+$app = Post-Json '/applications' @{ name = 'generation-demo' }
+$dep = Post-Json "/applications/$($app.id)/deployments" @{ specification = @{ simulated = $true } }
+$created = Post-Json "/deployments/$($dep.id)/reconcile"
+$oldId = $created.created[0].instance_id
+$jobId = $created.created[0].start_job_id
+$worker = Post-Json '/workers/register' @{ identity = 'manual-startup'; capabilities = @('start_instance') }
+$prefix = "/workers/$($worker.id)/jobs/$jobId"
+foreach ($number in 1..3) {
+    Post-Json "/workers/$($worker.id)/heartbeat" | Out-Null
+    Post-Json '/scheduling/run' | Out-Null
+    $claim = @{ attempt_number = $number; claim_id = [guid]::NewGuid().ToString() }
+    $grant = Post-Json "$prefix/claim" $claim
+    $report = @{} + $claim + @{
+        outcome = 'failed'; error = 'simulated readiness failure'; retryable = $true
+        instance_outcome = @{
+            instance_id = $oldId; expected_version = $grant.instance.version
+            state = 'failed'; phase = 'readiness_failed'
+        }
+    }
+    $accepted = Post-Json "$prefix/report" $report
+    if ($number -lt 3) { Start-Sleep -Seconds ([int][math]::Pow(2, $number - 1) * 5 + 1) }
+}
+Invoke-RestMethod "$base/deployments/$($dep.id)/replicas" | ConvertTo-Json -Depth 12
+Post-Json "/deployments/$($dep.id)/reconcile" | ConvertTo-Json -Depth 12
+Start-Sleep -Seconds 31
+Post-Json "/deployments/$($dep.id)/reconcile" | ConvertTo-Json -Depth 12
+Post-Json "/deployments/$($dep.id)/reconcile" | ConvertTo-Json -Depth 12
+Invoke-RestMethod "$base/instances?deployment_id=$($dep.id)" | Format-Table id, replica_index, generation, is_current, state, creation_reason
+# Replay the final accepted generation-1 failure; generation 2 stays pending.
+Post-Json "$prefix/report" $report | ConvertTo-Json -Depth 12
+```
+
+Expect one automatic generation-2 replacement and no additional replacement on
+repeat. Old UUID/job/attempt history remains queryable. Start a normal opted-in
+worker in another terminal and invoke scheduling to process generation 2; queued
+preparation may be processed first, requiring another scheduling call.
+
+Alternatively, before starting job-polling agents, fail the pending generation 2
+permanently and explicitly request generation 3. This also demonstrates that manual
+replacement does not reset the already-consumed automatic budget:
+
+```powershell
+$pending = @(Invoke-RestMethod "$base/instances?deployment_id=$($dep.id)&current=true")[0]
+Post-Json "/workers/$($worker.id)/heartbeat" | Out-Null
+Post-Json '/scheduling/run' | Out-Null
+$newPrefix = "/workers/$($worker.id)/jobs/$($pending.start_job_id)"
+$claim = @{ attempt_number = 1; claim_id = [guid]::NewGuid().ToString() }
+$grant = Post-Json "$newPrefix/claim" $claim
+$failure = @{} + $claim + @{
+    outcome = 'failed'; error = 'permanent simulated failure'
+    instance_outcome = @{
+        instance_id = $pending.id; expected_version = $grant.instance.version
+        state = 'failed'; phase = 'startup_failed'
+    }
+}
+$terminal = (Post-Json "$newPrefix/report" $failure).instance
+$terminalId = $terminal.id
+$request = @{
+    request_id = [guid]::NewGuid().ToString()
+    expected_slot_version = $terminal.slot_version
+    reason = 'Explicitly authorize simulated replacement after inspection'
+    acknowledge_simulated_uncertainty = $true
+}
+Post-Json "/instances/$terminalId/replace" $request | ConvertTo-Json -Depth 10
+Post-Json "/instances/$terminalId/replace" $request | ConvertTo-Json -Depth 10
+Invoke-RestMethod "$base/deployments/$($dep.id)/replicas" | ConvertTo-Json -Depth 12
+```
+
+B2-B's separate convergence controller is not implemented. There is no scale-down,
+active-job cancellation, force replacement of healthy/active work, real health
+monitor, Docker, or actual application execution.

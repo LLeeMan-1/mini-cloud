@@ -141,16 +141,18 @@ def test_v5_preserves_all_records_and_byte_exact_historical_http_acknowledgments
             if table == "instances":
                 columns = [column[1] for column in connection.exec_driver_sql("PRAGMA table_info(instances)")]
                 index = columns.index("replica_index")
-                assert [tuple(row[:index]) + tuple(row[index + 1:]) for row in after[table]] == before[table]
+                assert [tuple(value for name, value in zip(columns, row)
+                              if name not in ("replica_index", "generation", "creation_reason"))
+                        for row in after[table]] == before[table]
                 assert all(row[index] == 0 for row in after[table])
             elif table != "schema_migrations":
                 assert after[table] == before[table]
-        assert after["schema_migrations"] == [(1,), (2,), (3,), (4,), (5,)]
+        assert after["schema_migrations"] == [(1,), (2,), (3,), (4,), (5,), (6,)]
         assert connection.exec_driver_sql("SELECT desired_replicas,version FROM deployment_targets ORDER BY deployment_id").all() == [(1, 1)] * 7
         assert connection.exec_driver_sql("SELECT COUNT(*) FROM instances WHERE deployment_id=7").scalar_one() == 0
         assert connection.exec_driver_sql("PRAGMA foreign_key_check").all() == []
         with pytest.raises(IntegrityError, match="UNIQUE"):
-            connection.exec_driver_sql("INSERT INTO instances SELECT 'different-id', deployment_id, replica_index, start_job_id, worker_id, last_attempt_id, state,version,created_at,updated_at,last_observed_at,healthy_at,stopped_at,state_source,state_reason FROM instances WHERE deployment_id=1")
+            connection.exec_driver_sql("INSERT INTO instances SELECT 'different-id', deployment_id, replica_index, generation, creation_reason, start_job_id, worker_id, last_attempt_id, state,version,created_at,updated_at,last_observed_at,healthy_at,stopped_at,state_source,state_reason FROM instances WHERE deployment_id=1")
 
 
 @pytest.mark.parametrize("failure_point", ["drop_instances", "restore_instances", "version_record", "foreign_keys"])

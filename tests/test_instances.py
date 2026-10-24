@@ -10,7 +10,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from backend.control_plane.api.jobs import get_clock
-from backend.control_plane.persistence.models import Deployment, Instance, Job, utc_now
+from backend.control_plane.persistence.models import Deployment, Instance, Job, ReplicaSlot, utc_now
 from backend.worker.jobs import JobPoller, run_job_agent
 
 
@@ -383,6 +383,8 @@ def test_scheduler_can_skip_more_than_one_page_of_incompatible_jobs(setup):
             session.flush()
             startup = Job(deployment_id=deployment.id, kind="start_instance", created_at=older, next_run_at=older)
             session.add(startup)
+            session.flush()
+            session.add(ReplicaSlot(deployment_id=deployment.id, replica_index=0, created_at=older, updated_at=older))
             session.flush()
             session.add(Instance(deployment_id=deployment.id, start_job_id=startup.id, created_at=older, updated_at=older))
         session.commit()

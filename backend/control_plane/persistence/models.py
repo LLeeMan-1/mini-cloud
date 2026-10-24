@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import Boolean, CheckConstraint, DDL, DateTime, ForeignKey, Index, JSON, String, UniqueConstraint, event, text
+from sqlalchemy import Boolean, CheckConstraint, DDL, DateTime, ForeignKey, ForeignKeyConstraint, Index, JSON, String, UniqueConstraint, event, text
 from sqlalchemy.types import TypeDecorator
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -195,10 +195,48 @@ class JobRenewal(Base):
     lease_expires_at: Mapped[datetime] = mapped_column(UTCDateTime())
 
 
+class ReplicaSlot(Base):
+    __tablename__ = "replica_slots"
+    __table_args__ = (
+        ForeignKeyConstraint(["deployment_id", "replica_index", "current_generation"],
+                             ["instances.deployment_id", "instances.replica_index", "instances.generation"],
+                             deferrable=True, initially="DEFERRED", name="current_slot_incarnation"),
+        CheckConstraint("typeof(replica_index)='integer' AND replica_index >= 0", name="slot_index_valid"),
+        CheckConstraint("typeof(current_generation)='integer' AND current_generation > 0", name="slot_generation_valid"),
+        CheckConstraint("version > 0", name="slot_version_positive"),
+        CheckConstraint("replacement_limit = 1 AND automatic_replacements BETWEEN 0 AND replacement_limit",
+                        name="bounded_automatic_replacements"),
+    )
+
+    deployment_id: Mapped[int] = mapped_column(ForeignKey("deployments.id"), primary_key=True)
+    replica_index: Mapped[int] = mapped_column(primary_key=True)
+    current_generation: Mapped[int] = mapped_column(default=1)
+    version: Mapped[int] = mapped_column(default=1)
+    automatic_replacements: Mapped[int] = mapped_column(default=0)
+    replacement_limit: Mapped[int] = mapped_column(default=1)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now)
+
+
+event.listen(ReplicaSlot.__table__, "after_create", DDL("""
+    CREATE TRIGGER slots_valid_update BEFORE UPDATE ON replica_slots
+    WHEN NEW.deployment_id != OLD.deployment_id OR NEW.replica_index != OLD.replica_index
+      OR NEW.created_at != OLD.created_at OR NEW.replacement_limit != OLD.replacement_limit
+      OR NEW.version != OLD.version + 1 OR NEW.current_generation != OLD.current_generation + 1
+      OR NEW.automatic_replacements NOT IN (OLD.automatic_replacements, OLD.automatic_replacements + 1)
+    BEGIN SELECT RAISE(ABORT, 'invalid slot mutation'); END
+""").execute_if(dialect="sqlite"))
+
+
 class Instance(Base):
     __tablename__ = "instances"
     __table_args__ = (
-        UniqueConstraint("deployment_id", "replica_index", name="unique_replica_slot"),
+        UniqueConstraint("deployment_id", "replica_index", "generation", name="unique_replica_generation"),
+        ForeignKeyConstraint(["deployment_id", "replica_index"],
+                             ["replica_slots.deployment_id", "replica_slots.replica_index"]),
+        CheckConstraint("typeof(generation)='integer' AND generation > 0", name="valid_instance_generation"),
+        CheckConstraint("creation_reason IN ('initial','automatic_replacement','administrative_replacement')",
+                        name="valid_creation_reason"),
         CheckConstraint("typeof(replica_index) = 'integer' AND replica_index >= 0", name="valid_replica_index"),
         CheckConstraint("state IN ('pending','starting','healthy','failed','stopped')", name="valid_instance_state"),
         CheckConstraint("version > 0", name="positive_instance_version"),
@@ -210,6 +248,8 @@ class Instance(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
     deployment_id: Mapped[int] = mapped_column(ForeignKey("deployments.id"))
     replica_index: Mapped[int] = mapped_column(default=0)
+    generation: Mapped[int] = mapped_column(default=1)
+    creation_reason: Mapped[str] = mapped_column(String(40), default="initial")
     start_job_id: Mapped[int] = mapped_column(ForeignKey("jobs.id"), unique=True)
     worker_id: Mapped[int | None] = mapped_column(ForeignKey("workers.id"))
     last_attempt_id: Mapped[int | None] = mapped_column(ForeignKey("job_attempts.id"))
@@ -228,6 +268,7 @@ event.listen(Instance.__table__, "after_create", DDL("""
     CREATE TRIGGER instances_valid_transition BEFORE UPDATE ON instances
     WHEN NEW.id != OLD.id OR NEW.deployment_id != OLD.deployment_id OR NEW.start_job_id != OLD.start_job_id
       OR NEW.replica_index != OLD.replica_index
+      OR NEW.generation != OLD.generation OR NEW.creation_reason != OLD.creation_reason
       OR NEW.created_at != OLD.created_at OR NEW.version != OLD.version + 1
       OR (NEW.state != OLD.state AND NOT (
         (OLD.state='pending' AND NEW.state IN ('starting','failed')) OR
@@ -236,6 +277,28 @@ event.listen(Instance.__table__, "after_create", DDL("""
         (OLD.state='healthy' AND NEW.state='stopped')
       )) OR OLD.state='stopped'
     BEGIN SELECT RAISE(ABORT, 'invalid instance mutation'); END
+""").execute_if(dialect="sqlite"))
+
+
+class ReplacementReceipt(Base):
+    __tablename__ = "replacement_receipts"
+
+    request_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    previous_instance_id: Mapped[str] = mapped_column(ForeignKey("instances.id"))
+    new_instance_id: Mapped[str] = mapped_column(ForeignKey("instances.id"), unique=True)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON)
+    acknowledgment: Mapped[dict[str, Any]] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now)
+
+
+event.listen(ReplacementReceipt.__table__, "after_create", DDL("""
+    CREATE TRIGGER replacement_receipts_immutable BEFORE UPDATE ON replacement_receipts
+    BEGIN SELECT RAISE(ABORT, 'replacement receipt is immutable'); END
+""").execute_if(dialect="sqlite"))
+
+event.listen(ReplacementReceipt.__table__, "after_create", DDL("""
+    CREATE TRIGGER replacement_receipts_no_delete BEFORE DELETE ON replacement_receipts
+    BEGIN SELECT RAISE(ABORT, 'replacement receipt is immutable'); END
 """).execute_if(dialect="sqlite"))
 
 

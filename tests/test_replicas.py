@@ -285,7 +285,7 @@ def test_partial_startup_retry_terminal_failure_and_stop_are_materialized(setup)
     response = client.post(terminal_prefix + "/report", json=terminal_failed)
     assert response.status_code == 200
     before = snapshot(client)
-    assert reconcile(client, terminal_dep)["blocked"][0]["reason"] == "terminal_startup_failure"
+    assert reconcile(client, terminal_dep)["blocked"][0]["reason"] == "permanent_startup_failure"
     assert snapshot(client) == before
     instance = response.json()["instance"]
     assert client.post(f"/instances/{instance['id']}/stop", json={"expected_version": instance["version"]}).status_code == 200
@@ -368,9 +368,9 @@ def test_sqlite_slot_uniqueness_immutability_and_target_checks(setup):
                 "SELECT deployment_id,kind,state,created_at,next_run_at,attempt_count,max_attempts "
                 "FROM jobs WHERE id=:job RETURNING id"), {"job": slot["start_job_id"]}).scalar_one()
             connection.execute(text(
-                "INSERT INTO instances (id,deployment_id,replica_index,start_job_id,worker_id,last_attempt_id,"
+                "INSERT INTO instances (id,deployment_id,replica_index,generation,creation_reason,start_job_id,worker_id,last_attempt_id,"
                 "state,version,created_at,updated_at,last_observed_at,healthy_at,stopped_at,state_source,state_reason) "
-                "SELECT :newid,deployment_id,replica_index,:job,worker_id,last_attempt_id,state,version,created_at,"
+                "SELECT :newid,deployment_id,replica_index,generation,creation_reason,:job,worker_id,last_attempt_id,state,version,created_at,"
                 "updated_at,last_observed_at,healthy_at,stopped_at,state_source,state_reason FROM instances WHERE id=:id"),
                 {"newid": str(uuid4()), "job": job_id, "id": slot["instance_id"]})
 

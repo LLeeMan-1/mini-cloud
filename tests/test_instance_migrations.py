@@ -149,4 +149,4 @@ def test_concurrent_v4_startups_preserve_history(version_three):
     with engine.connect() as connection:
         assert connection.exec_driver_sql("SELECT COUNT(*) FROM job_attempts").scalar_one() == 4
         assert connection.exec_driver_sql("SELECT COUNT(*) FROM job_renewals").scalar_one() == 1
-        assert connection.exec_driver_sql("SELECT MAX(version) FROM schema_migrations").scalar_one() == 5
+        assert connection.exec_driver_sql("SELECT MAX(version) FROM schema_migrations").scalar_one() == 6

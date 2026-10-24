@@ -82,11 +82,24 @@ class InstanceStop(BaseModel):
     expected_version: Annotated[int, Field(strict=True, gt=0)]
 
 
+class ReplacementStatus(BaseModel):
+    status: Literal["retained", "blocked", "cooldown", "eligible"]
+    reason: str
+    eligible_at: AwareDatetime | None
+    simulated: Literal[True]
+
+
 class InstanceRead(BaseModel):
     id: UUID
     deployment_id: int
     # Old durable report receipts omit this field. Do not insert it on replay.
     replica_index: Annotated[int, Field(ge=0)] | None = None
+    generation: Annotated[int, Field(gt=0)] | None = None
+    creation_reason: Literal["initial", "automatic_replacement", "administrative_replacement"] | None = None
+    is_current: bool | None = None
+    current_generation: int | None = None
+    slot_version: int | None = None
+    replacement: ReplacementStatus | None = None
     start_job_id: int
     worker_id: int | None
     last_attempt_id: int | None
@@ -271,10 +284,46 @@ class ReplicaSlotRead(BaseModel):
     replica_index: int
     instance_id: UUID
     start_job_id: int
+    generation: int
 
 
 class BlockedReplica(ReplicaSlotRead):
-    reason: Literal["stopped", "terminal_startup_failure"]
+    reason: str
+
+
+class SlotInspection(ReplicaSlotRead):
+    slot_version: int
+    automatic_replacements: int
+    replacement_limit: int
+    replacement: ReplacementStatus
+
+
+class ReplacementRead(ReplicaSlotRead):
+    deployment_id: int
+    previous_instance_id: UUID
+    previous_generation: int
+    slot_version: int
+    creation_reason: Literal["automatic_replacement", "administrative_replacement"]
+    simulated: Literal[True]
+
+
+class AdministrativeReplacement(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    request_id: UUID
+    expected_slot_version: Annotated[int, Field(strict=True, gt=0)]
+    reason: Annotated[str, StringConstraints(strict=True, strip_whitespace=True, min_length=1, max_length=500)]
+    acknowledge_simulated_uncertainty: Annotated[bool, Field(strict=True)]
+
+    @field_validator("acknowledge_simulated_uncertainty")
+    @classmethod
+    def require_acknowledgment(cls, value):
+        if not value:
+            raise ValueError("Explicit acknowledgment of simulated uncertainty is required")
+        return value
+
+
+class AdministrativeReplacementRead(ReplacementRead):
+    request_id: UUID
 
 
 class ReplicaSummary(ReplicaTargetRead):
@@ -285,6 +334,8 @@ class ReplicaSummary(ReplicaTargetRead):
     expired_ownership_replicas: int
     unavailable_worker_replicas: int
     blocked: list[BlockedReplica]
+    slots: list[SlotInspection]
+    replacement_eligible: list[SlotInspection]
 
 
 class ReconciliationRead(BaseModel):
@@ -294,3 +345,6 @@ class ReconciliationRead(BaseModel):
     created_count: int
     created: list[ReplicaSlotRead]
     blocked: list[BlockedReplica]
+    replaced_count: int
+    replaced: list[ReplacementRead]
+    replacement_eligible: list[SlotInspection]
