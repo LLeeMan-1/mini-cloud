@@ -5,11 +5,12 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import select
 from sqlalchemy.engine import Engine
 
-from backend.control_plane.persistence.models import Application, Deployment, Worker, Job, JobAttempt, JobRenewal, utc_now
+from backend.control_plane.persistence.models import Application, Deployment, Worker, Job, JobAttempt, JobRenewal, Instance, utc_now
+from backend.control_plane.persistence import schema_v3
 from backend.control_plane.job_policy import JobPolicy
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 def create_version_two_jobs(connection):
@@ -35,7 +36,7 @@ def upgrade_jobs_v3(connection, policy, now):
     connection.exec_driver_sql("DROP INDEX IF EXISTS one_active_job_per_worker")
     connection.exec_driver_sql("DROP INDEX IF EXISTS jobs_queue_order")
     connection.exec_driver_sql("ALTER TABLE jobs RENAME TO jobs_v2")
-    Job.__table__.create(connection)
+    schema_v3.create_table(connection, "jobs")
     connection.exec_driver_sql("""
         INSERT INTO jobs (id, deployment_id, worker_id, kind, state, created_at, assigned_at,
             claimed_at, finished_at, claim_id, result, error, attempt_count, max_attempts,
@@ -51,8 +52,8 @@ def upgrade_jobs_v3(connection, policy, now):
            (now + timedelta(seconds=policy.assignment_seconds)).replace(tzinfo=None).isoformat(" ", timespec="microseconds"),
            (now + timedelta(seconds=policy.lease_seconds)).replace(tzinfo=None).isoformat(" ", timespec="microseconds")))
     connection.exec_driver_sql("DROP TABLE jobs_v2")
-    JobAttempt.__table__.create(connection)
-    JobRenewal.__table__.create(connection)
+    schema_v3.create_table(connection, "job_attempts")
+    schema_v3.create_table(connection, "job_renewals")
     for row in connection.execute(select(Job)).mappings():
         if row["attempt_count"] == 0:
             continue
@@ -69,6 +70,26 @@ def upgrade_jobs_v3(connection, policy, now):
             finished_at=row["finished_at"], failure_code=row["last_failure_code"], retryable=False,
             result=row["result"], error=row["error"], report_payload=payload, report_ack=ack,
         ))
+
+
+def upgrade_instances_v4(connection):
+    """Rebuild parent/children together with foreign keys enabled throughout."""
+    tables = (Job.__table__, JobAttempt.__table__, JobRenewal.__table__)
+    for table in tables:
+        connection.exec_driver_sql(f"CREATE TEMP TABLE v4_{table.name} AS SELECT * FROM {table.name}")
+    for table in reversed(tables):
+        connection.exec_driver_sql(f"DROP TABLE {table.name}")
+    for table in tables:
+        table.create(connection)
+        columns = ", ".join(column.name for column in table.columns)
+        connection.exec_driver_sql(f"INSERT INTO {table.name} ({columns}) SELECT {columns} FROM v4_{table.name}")
+        connection.exec_driver_sql(f"DROP TABLE temp.v4_{table.name}")
+    columns = connection.exec_driver_sql("PRAGMA table_info(workers)").all()
+    if not any(column[1] == "capabilities" for column in columns):
+        connection.exec_driver_sql("""ALTER TABLE workers ADD COLUMN capabilities JSON NOT NULL DEFAULT '["prepare_deployment"]'""")
+    Instance.__table__.create(connection)
+    if connection.exec_driver_sql("PRAGMA foreign_key_check").all():
+        raise RuntimeError("Foreign-key integrity check failed during version 4 migration")
 
 
 def initialize_database(engine: Engine, policy: JobPolicy | None = None, clock=utc_now) -> None:
@@ -111,8 +132,10 @@ def initialize_database(engine: Engine, policy: JobPolicy | None = None, clock=u
                     """)
                     connection.exec_driver_sql("DROP TABLE workers")
                     connection.exec_driver_sql("ALTER TABLE workers_migration_v1 RENAME TO workers")
-                for table in (Application.__table__, Deployment.__table__, Worker.__table__):
+                for table in (Application.__table__, Deployment.__table__):
                     table.create(connection, checkfirst=True)
+                if not connection.exec_driver_sql("PRAGMA table_info(workers)").all():
+                    schema_v3.create_table(connection, "workers")
                 connection.exec_driver_sql("INSERT INTO schema_migrations (version) VALUES (1)")
             if version < 2:
                 create_version_two_jobs(connection)
@@ -127,6 +150,9 @@ def initialize_database(engine: Engine, policy: JobPolicy | None = None, clock=u
             if version < 3:
                 upgrade_jobs_v3(connection, policy, clock())
                 connection.exec_driver_sql("INSERT INTO schema_migrations (version) VALUES (3)")
+            if version < 4:
+                upgrade_instances_v4(connection)
+                connection.exec_driver_sql("INSERT INTO schema_migrations (version) VALUES (4)")
             connection.commit()
         except BaseException:
             connection.rollback()

@@ -2,6 +2,7 @@
 
 from datetime import datetime, timezone
 from typing import Any
+from uuid import uuid4
 
 from sqlalchemy import Boolean, CheckConstraint, DDL, DateTime, ForeignKey, Index, JSON, String, UniqueConstraint, event, text
 from sqlalchemy.types import TypeDecorator
@@ -65,12 +66,17 @@ class Worker(Base):
     identity: Mapped[str] = mapped_column(String(100), unique=True)
     registered_at: Mapped[datetime] = mapped_column(UTCDateTime())
     last_heartbeat_at: Mapped[datetime] = mapped_column(UTCDateTime())
+    capabilities: Mapped[list[str]] = mapped_column(
+        JSON, default=lambda: ["prepare_deployment"], server_default=text("'[\"prepare_deployment\"]'")
+    )
 
 
 class Job(Base):
     __tablename__ = "jobs"
     __table_args__ = (
-        CheckConstraint("kind = 'prepare_deployment'", name="valid_job_kind"),
+        CheckConstraint("kind IN ('prepare_deployment', 'start_instance')", name="valid_job_kind"),
+        Index("one_prepare_job_per_deployment", "deployment_id", unique=True,
+              sqlite_where=text("kind = 'prepare_deployment'")),
         CheckConstraint("state IN ('queued', 'assigned', 'claimed', 'completed', 'failed')",
                         name="valid_job_state"),
         CheckConstraint("""
@@ -104,7 +110,7 @@ class Job(Base):
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    deployment_id: Mapped[int] = mapped_column(ForeignKey("deployments.id"), unique=True)
+    deployment_id: Mapped[int] = mapped_column(ForeignKey("deployments.id"))
     worker_id: Mapped[int | None] = mapped_column(ForeignKey("workers.id"), default=None)
     kind: Mapped[str] = mapped_column(String(30), default="prepare_deployment")
     state: Mapped[str] = mapped_column(String(20), default="queued")
@@ -164,6 +170,46 @@ class JobRenewal(Base):
     renewal_id: Mapped[str] = mapped_column(String(36))
     granted_at: Mapped[datetime] = mapped_column(UTCDateTime())
     lease_expires_at: Mapped[datetime] = mapped_column(UTCDateTime())
+
+
+class Instance(Base):
+    __tablename__ = "instances"
+    __table_args__ = (
+        CheckConstraint("state IN ('pending','starting','healthy','failed','stopped')", name="valid_instance_state"),
+        CheckConstraint("version > 0", name="positive_instance_version"),
+        CheckConstraint("state_source IN ('control_plane','worker_report','manual')", name="valid_instance_source"),
+        CheckConstraint("state != 'healthy' OR (worker_id IS NOT NULL AND last_attempt_id IS NOT NULL AND healthy_at IS NOT NULL AND last_observed_at IS NOT NULL)", name="healthy_instance_observed"),
+        CheckConstraint("(state = 'stopped') = (stopped_at IS NOT NULL)", name="coherent_instance_stop"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    deployment_id: Mapped[int] = mapped_column(ForeignKey("deployments.id"), unique=True)
+    start_job_id: Mapped[int] = mapped_column(ForeignKey("jobs.id"), unique=True)
+    worker_id: Mapped[int | None] = mapped_column(ForeignKey("workers.id"))
+    last_attempt_id: Mapped[int | None] = mapped_column(ForeignKey("job_attempts.id"))
+    state: Mapped[str] = mapped_column(String(20), default="pending")
+    version: Mapped[int] = mapped_column(default=1)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now)
+    last_observed_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
+    healthy_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
+    stopped_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
+    state_source: Mapped[str] = mapped_column(String(20), default="control_plane")
+    state_reason: Mapped[str] = mapped_column(String(100), default="created")
+
+
+event.listen(Instance.__table__, "after_create", DDL("""
+    CREATE TRIGGER instances_valid_transition BEFORE UPDATE ON instances
+    WHEN NEW.id != OLD.id OR NEW.deployment_id != OLD.deployment_id OR NEW.start_job_id != OLD.start_job_id
+      OR NEW.created_at != OLD.created_at OR NEW.version != OLD.version + 1
+      OR (NEW.state != OLD.state AND NOT (
+        (OLD.state='pending' AND NEW.state IN ('starting','failed')) OR
+        (OLD.state='starting' AND NEW.state IN ('healthy','failed')) OR
+        (OLD.state='failed' AND NEW.state IN ('starting','stopped')) OR
+        (OLD.state='healthy' AND NEW.state='stopped')
+      )) OR OLD.state='stopped'
+    BEGIN SELECT RAISE(ABORT, 'invalid instance mutation'); END
+""").execute_if(dialect="sqlite"))
 
 
 event.listen(

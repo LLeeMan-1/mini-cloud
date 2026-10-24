@@ -17,7 +17,7 @@ ServerTime = Annotated[datetime, Depends(utc_now)]
 def register_worker(
     body: WorkerRegister, session: DatabaseSession, now: ServerTime, request: Request
 ):
-    worker = workers.register_worker(session, body.identity, now)
+    worker = workers.register_worker(session, body.identity, now, body.capabilities)
     return workers.worker_view(worker, now, request.app.state.worker_timeout)
 
 

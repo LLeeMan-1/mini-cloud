@@ -11,6 +11,8 @@ from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, JsonValue, Str
 ApplicationName = Annotated[
     str, StringConstraints(strict=True, strip_whitespace=True, min_length=1, max_length=100)
 ]
+JobKind = Literal["prepare_deployment", "start_instance"]
+InstanceState = Literal["pending", "starting", "healthy", "failed", "stopped"]
 
 
 class ApplicationCreate(BaseModel):
@@ -54,6 +56,7 @@ class WorkerRegister(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     identity: ApplicationName
+    capabilities: list[JobKind] = Field(default_factory=lambda: ["prepare_deployment"], max_length=2)
 
 
 class WorkerRead(BaseModel):
@@ -62,9 +65,56 @@ class WorkerRead(BaseModel):
     registered_at: AwareDatetime
     last_heartbeat_at: AwareDatetime
     status: Literal["available", "unavailable"]
+    capabilities: list[JobKind]
 
 
 JobState = Literal["queued", "assigned", "claimed", "completed", "failed"]
+
+
+class InstanceCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class InstanceStop(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expected_version: Annotated[int, Field(strict=True, gt=0)]
+
+
+class InstanceRead(BaseModel):
+    id: UUID
+    deployment_id: int
+    start_job_id: int
+    worker_id: int | None
+    last_attempt_id: int | None
+    state: InstanceState
+    version: int
+    created_at: AwareDatetime
+    updated_at: AwareDatetime
+    last_observed_at: AwareDatetime | None
+    healthy_at: AwareDatetime | None
+    stopped_at: AwareDatetime | None
+    state_source: Literal["control_plane", "worker_report", "manual"]
+    state_reason: str
+    simulated: Literal[True]
+    worker_available: bool | None
+    startup_job_state: JobState
+    current_worker_id: int | None
+    current_attempt_number: int | None
+    ownership_valid: bool
+
+
+class InstanceOutcome(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    instance_id: UUID
+    expected_version: Annotated[int, Field(strict=True, gt=0)]
+    state: Literal["healthy", "failed"]
+    phase: Literal["readiness_passed", "startup_failed", "readiness_failed"]
+
+    @model_validator(mode="after")
+    def valid_phase(self):
+        if (self.state == "healthy") != (self.phase == "readiness_passed"):
+            raise ValueError("Readiness success must report healthy; failure must report failed")
+        return self
 
 
 class JobRead(BaseModel):
@@ -73,7 +123,7 @@ class JobRead(BaseModel):
     id: int
     deployment_id: int
     worker_id: int | None
-    kind: Literal["prepare_deployment"]
+    kind: JobKind
     state: JobState
     created_at: AwareDatetime
     assigned_at: AwareDatetime | None
@@ -93,11 +143,13 @@ class JobRead(BaseModel):
 class ClaimRead(JobRead):
     server_time: AwareDatetime
     renewal_interval: float
+    instance: InstanceRead | None = None
 
 
 class ReportRead(JobRead):
     acknowledged_attempt_number: int
     attempt_outcome: Literal["completed", "failed"]
+    instance: InstanceRead | None = None
 
 
 class AttemptRead(BaseModel):
@@ -118,11 +170,13 @@ class AttemptRead(BaseModel):
 class JobAssignment(BaseModel):
     id: int
     deployment_id: int
-    kind: Literal["prepare_deployment"]
+    kind: JobKind
     state: Literal["assigned"]
     specification: dict[str, JsonValue]
     attempt_number: int
     assignment_expires_at: AwareDatetime
+    instance_id: UUID | None = None
+    instance_version: int | None = None
 
 
 class JobClaim(BaseModel):
@@ -151,10 +205,15 @@ class JobReport(JobClaim):
     outcome: Literal["completed", "failed"]
     result: dict[str, JsonValue] | None = None
     retryable: bool = Field(default=False, strict=True)
+    instance_outcome: InstanceOutcome | None = None
     error: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=2000)] | None = None
 
     @model_validator(mode="after")
     def coherent_outcome(self):
+        if self.instance_outcome is not None and (
+            (self.outcome == "completed") != (self.instance_outcome.state == "healthy")
+        ):
+            raise ValueError("Job and instance outcomes must agree")
         if self.outcome == "completed" and self.error is not None:
             raise ValueError("Completed reports cannot contain an error")
         if self.outcome == "completed" and self.retryable:

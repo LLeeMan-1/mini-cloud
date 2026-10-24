@@ -26,7 +26,8 @@ ServerClock = Annotated[jobs.Clock, Depends(get_clock)]
 
 
 def translate_error(error: Exception) -> HTTPException:
-    return HTTPException(status_code=404 if isinstance(error, jobs.RecordNotFound) else 409,
+    return HTTPException(status_code=404 if isinstance(error, jobs.RecordNotFound) else
+                         422 if isinstance(error, jobs.InvalidJobReport) else 409,
                          detail={"code": getattr(error, "code", "not_found"), "message": str(error)})
 
 
@@ -76,7 +77,7 @@ def get_job(job_id: PositiveID, session: DatabaseSession):
         raise translate_error(error) from None
 
 
-@router.get("/workers/{worker_id}/jobs", response_model=list[JobAssignment])
+@router.get("/workers/{worker_id}/jobs", response_model=list[JobAssignment], response_model_exclude_unset=True)
 def poll_jobs(worker_id: PositiveID, session: DatabaseSession, clock: ServerClock):
     try:
         return jobs.poll_jobs(session, worker_id, clock)
@@ -84,7 +85,7 @@ def poll_jobs(worker_id: PositiveID, session: DatabaseSession, clock: ServerCloc
         raise translate_error(error) from None
 
 
-@router.post("/workers/{worker_id}/jobs/{job_id}/claim", response_model=ClaimRead)
+@router.post("/workers/{worker_id}/jobs/{job_id}/claim", response_model=ClaimRead, response_model_exclude_unset=True)
 def claim_job(
     worker_id: PositiveID, job_id: PositiveID, body: JobClaim,
     session: DatabaseSession, request: Request, clock: ServerClock,
@@ -109,7 +110,7 @@ def renew_job(
         raise translate_error(error) from None
 
 
-@router.post("/workers/{worker_id}/jobs/{job_id}/report", response_model=ReportRead)
+@router.post("/workers/{worker_id}/jobs/{job_id}/report", response_model=ReportRead, response_model_exclude_unset=True)
 def report_job(
     worker_id: PositiveID, job_id: PositiveID, body: JobReport,
     session: DatabaseSession, clock: ServerClock, request: Request,
@@ -118,6 +119,8 @@ def report_job(
         return jobs.report_job(session, worker_id, job_id, str(body.claim_id),
                                body.outcome, body.result, body.error, clock,
                                attempt_number=body.attempt_number, retryable=body.retryable,
-                               policy=request.app.state.job_policy)
-    except (jobs.RecordNotFound, jobs.JobConflict) as error:
+                               policy=request.app.state.job_policy,
+                               instance_outcome=body.instance_outcome.model_dump(mode="json") if body.instance_outcome else None,
+                               worker_timeout=request.app.state.worker_timeout)
+    except (jobs.RecordNotFound, jobs.JobConflict, jobs.InvalidJobReport) as error:
         raise translate_error(error) from None

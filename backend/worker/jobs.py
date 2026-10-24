@@ -19,6 +19,27 @@ class JobPoller:
         self.pending = None
         self.clock = clock
 
+    def simulate_start(self, instance_id):
+        """Fixed simulation hook; never interprets specifications or executes code."""
+        return True
+
+    def simulate_readiness(self, instance_id):
+        """A separate readiness step, deliberately distinct from simulated startup."""
+        return True
+
+    def ready_to_report(self, job, state, phase):
+        observation = {"instance_id": job["instance_id"], "expected_version": job["instance_version"],
+                       "state": state, "phase": phase}
+        job["report_body"] = {
+            "claim_id": job["claim_id"], "attempt_number": job["attempt_number"],
+            "outcome": "completed" if state == "healthy" else "failed", "instance_outcome": observation,
+        }
+        if state == "healthy":
+            job["report_body"]["result"] = {"simulated": True}
+        else:
+            job["report_body"]["error"] = "simulated " + phase.replace("_", " ")
+        job["phase"] = "report"
+
     def abandon_expired(self):
         if self.pending and self.pending.get("local_deadline", float("inf")) <= self.clock():
             logger.warning("Local lease deadline passed; discarding simulated work")
@@ -77,11 +98,16 @@ class JobPoller:
                 return False
             assignment = assignments[0]
             if (not isinstance(assignment, dict) or type(assignment.get("id")) is not int
-                    or assignment["id"] <= 0 or assignment.get("kind") != "prepare_deployment"
+                    or assignment["id"] <= 0 or assignment.get("kind") not in ("prepare_deployment", "start_instance")
                     or type(assignment.get("attempt_number")) is not int or assignment["attempt_number"] <= 0):
                 raise ValueError("Invalid simulated assignment")
             self.pending = {"id": assignment["id"], "attempt_number": assignment["attempt_number"],
-                            "claim_id": str(uuid4()), "phase": "claim"}
+                            "claim_id": str(uuid4()), "phase": "claim", "kind": assignment["kind"]}
+            if assignment["kind"] == "start_instance":
+                if not isinstance(assignment.get("instance_id"), str):
+                    self.pending = None
+                    raise ValueError("Startup assignment must identify its instance")
+                self.pending["instance_id"] = assignment["instance_id"]
             return True
         job = self.pending
         prefix = f"/workers/{worker_id}/jobs/{job['id']}"
@@ -97,9 +123,27 @@ class JobPoller:
                 self.grant(data, start)
             except (KeyError, TypeError) as error:
                 raise ValueError("Invalid claim grant") from error
-            job["phase"] = "report"
+            if job["kind"] == "start_instance":
+                instance = data.get("instance")
+                if (not isinstance(instance, dict) or instance.get("id") != job["instance_id"]
+                        or instance.get("state") != "starting" or type(instance.get("version")) is not int):
+                    raise ValueError("Startup claim must confirm instance ownership")
+                job["instance_version"] = instance["version"]
+                job["phase"] = "startup"
+            else:
+                job["phase"] = "report"
             return True
-        response = client.post(prefix + "/report", json={
+        if job["phase"] == "startup":
+            if self.simulate_start(job["instance_id"]):
+                job["phase"] = "readiness"
+            else:
+                self.ready_to_report(job, "failed", "startup_failed")
+            return True
+        if job["phase"] == "readiness":
+            ready = self.simulate_readiness(job["instance_id"])
+            self.ready_to_report(job, "healthy" if ready else "failed", "readiness_passed" if ready else "readiness_failed")
+            return True
+        response = client.post(prefix + "/report", json=job.get("report_body") or {
             **body, "outcome": "completed", "result": {"simulated": True}
         })
         response.raise_for_status()
@@ -129,7 +173,8 @@ def run_job_agent(client, identity, interval, stop, *, clock=monotonic):
         if clock() >= heartbeat_due:
             try:
                 if worker_id is None:
-                    response = client.post("/workers/register", json={"identity": identity.strip()})
+                    response = client.post("/workers/register", json={"identity": identity.strip(),
+                        "capabilities": ["prepare_deployment", "start_instance"]})
                     response.raise_for_status()
                     data = response.json()
                     if not isinstance(data, dict) or type(data.get("id")) is not int or data["id"] <= 0:
@@ -178,7 +223,7 @@ def run_job_agent(client, identity, interval, stop, *, clock=monotonic):
         if worker_id is not None and clock() >= poll_due:
             try:
                 more = poller.step(client, worker_id)
-                if more and poller.pending and poller.pending["phase"] == "report":
+                if more and poller.pending and poller.pending["phase"] in ("report", "startup"):
                     # A fresh claim gets its own renewal retry budget.
                     renewal_retry = 1.0
                 poll_retry = 1.0

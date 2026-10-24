@@ -9,6 +9,7 @@ from sqlalchemy.exc import IntegrityError
 
 from backend.control_plane.main import create_app
 from backend.control_plane.persistence.database import create_database_engine
+from backend.control_plane.persistence import schema_v3
 from backend.control_plane.persistence.migrations import SCHEMA_VERSION, initialize_database
 from backend.control_plane.persistence.models import Application, Deployment, Worker
 
@@ -66,15 +67,15 @@ def test_legacy_upgrade_preserves_data_constraints_and_trigger(legacy_database):
         after = snapshot(connection)
         assert after["applications"] == before["applications"]
         assert after["deployments"] == before["deployments"]
-        assert after["workers"] == [row[:4] for row in before["workers"]]
+        assert [row[:4] for row in after["workers"]] == [row[:4] for row in before["workers"]]
         assert [row[1] for row in connection.exec_driver_sql("PRAGMA table_info(workers)")] == [
-            "id", "identity", "registered_at", "last_heartbeat_at"
+            "id", "identity", "registered_at", "last_heartbeat_at", "capabilities"
         ]
         table_sql = connection.exec_driver_sql(
             "SELECT sql FROM sqlite_master WHERE name = 'workers'"
         ).scalar_one()
         assert "valid_worker_status" not in table_sql
-        assert connection.exec_driver_sql("SELECT version FROM schema_migrations ORDER BY version").all() == [(1,), (2,), (3,)]
+        assert connection.exec_driver_sql("SELECT version FROM schema_migrations ORDER BY version").all() == [(1,), (2,), (3,), (4,)]
     with engine.begin() as connection:
         with pytest.raises(IntegrityError, match="specification is immutable"):
             connection.exec_driver_sql("UPDATE deployments SET specification = '{}' WHERE id = 9")
@@ -142,7 +143,7 @@ def test_simultaneous_startups_serialize_migration(legacy_database):
     with ThreadPoolExecutor(max_workers=3) as executor:
         list(executor.map(startup, range(3)))
     with engine.connect() as connection:
-        assert connection.exec_driver_sql("SELECT version FROM schema_migrations ORDER BY version").all() == [(1,), (2,), (3,)]
+        assert connection.exec_driver_sql("SELECT version FROM schema_migrations ORDER BY version").all() == [(1,), (2,), (3,), (4,)]
         assert connection.exec_driver_sql("SELECT id FROM workers ORDER BY id").all() == [(7,), (12,)]
         assert "status" not in [row[1] for row in connection.exec_driver_sql("PRAGMA table_info(workers)")]
 
@@ -167,8 +168,9 @@ def version_one_database(tmp_path):
     path = tmp_path / "version-one.db"
     engine = create_database_engine(path)
     with engine.begin() as connection:
-        for table in (Application.__table__, Deployment.__table__, Worker.__table__):
+        for table in (Application.__table__, Deployment.__table__):
             table.create(connection)
+        schema_v3.create_table(connection, "workers")
         connection.exec_driver_sql("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY)")
         connection.exec_driver_sql("INSERT INTO schema_migrations VALUES (1)")
         connection.exec_driver_sql("""
@@ -194,11 +196,14 @@ def test_version_two_backfills_only_pending_and_preserves_all_records(version_on
     initialize_database(engine)
     initialize_database(engine)
     with engine.connect() as connection:
-        assert snapshot(connection) == before
+        after = snapshot(connection)
+        assert after["applications"] == before["applications"]
+        assert after["deployments"] == before["deployments"]
+        assert [row[:4] for row in after["workers"]] == before["workers"]
         assert connection.exec_driver_sql(
             "SELECT deployment_id, state, created_at FROM jobs"
         ).all() == [(1, 'queued', '2026-10-14 00:00:00.000000')]
-        assert connection.exec_driver_sql("SELECT version FROM schema_migrations ORDER BY version").all() == [(1,), (2,), (3,)]
+        assert connection.exec_driver_sql("SELECT version FROM schema_migrations ORDER BY version").all() == [(1,), (2,), (3,), (4,)]
 
 
 def test_version_two_failure_rolls_back_and_can_retry(version_one_database):

@@ -13,16 +13,17 @@ class WorkerNotFound(Exception):
     pass
 
 
-def register_worker(session: Session, identity: str, now: datetime) -> Worker:
+def register_worker(session: Session, identity: str, now: datetime, capabilities=None) -> Worker:
     # The unique key and atomic upsert also handle concurrent registration retries.
     statement = insert(Worker).values(
-        identity=identity, registered_at=now, last_heartbeat_at=now
+        identity=identity, registered_at=now, last_heartbeat_at=now,
+        capabilities=["prepare_deployment"] if capabilities is None else sorted(set(capabilities)),
     )
     statement = statement.on_conflict_do_update(
         index_elements=[Worker.identity],
         set_={"last_heartbeat_at": func.max(
             Worker.last_heartbeat_at, statement.excluded.last_heartbeat_at
-        )},
+        ), "capabilities": statement.excluded.capabilities},
     ).returning(Worker)
     worker = session.scalars(statement).one()
     session.commit()
@@ -58,4 +59,5 @@ def worker_view(worker: Worker, now: datetime, timeout: float) -> dict:
         "registered_at": worker.registered_at,
         "last_heartbeat_at": worker.last_heartbeat_at,
         "status": "unavailable" if expired else "available",
+        "capabilities": worker.capabilities,
     }

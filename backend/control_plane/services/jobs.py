@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 
 from backend.control_plane.persistence.models import Deployment, Job, JobAttempt, JobRenewal, Worker, utc_now
 from backend.control_plane.job_policy import JobPolicy
+from backend.control_plane.services import instances
 
 Clock = Callable[[], datetime]
 
@@ -21,6 +22,10 @@ class JobConflict(Exception):
     def __init__(self, message, code="invalid_transition"):
         super().__init__(message)
         self.code = code
+
+
+class InvalidJobReport(Exception):
+    code = "invalid_job_report"
 
 
 @contextmanager
@@ -81,9 +86,16 @@ def poll_jobs(session, worker_id, clock=utc_now):
     rows = session.execute(select(Job, Deployment.specification).join(Deployment).where(
         Job.worker_id == worker_id, Job.state == "assigned", Job.assignment_expires_at > clock()
     ).order_by(Job.created_at, Job.id))
-    return [{"id": job.id, "deployment_id": job.deployment_id, "kind": job.kind,
-             "state": job.state, "specification": spec, "attempt_number": job.attempt_count,
-             "assignment_expires_at": job.assignment_expires_at} for job, spec in rows]
+    result = []
+    for job, spec in rows:
+        entry = {"id": job.id, "deployment_id": job.deployment_id, "kind": job.kind,
+                 "state": job.state, "specification": spec, "attempt_number": job.attempt_count,
+                 "assignment_expires_at": job.assignment_expires_at}
+        if job.kind == "start_instance":
+            instance = instances.find_for_job(session, job)
+            entry.update(instance_id=instance.id, instance_version=instance.version)
+        result.append(entry)
+    return result
 
 
 def attempt_for(session, job_id, number):
@@ -129,7 +141,11 @@ def claim_job(session, worker_id, job_id, claim_id, timeout, clock=utc_now, *, a
             attempt.state = "claimed"
             attempt.claim_id = claim_id
             attempt.claimed_at = now
+            if job.kind == "start_instance":
+                instances.record_claim(session, job, attempt, now)
         response = {**snapshot(job), "server_time": now, "renewal_interval": policy.renewal_seconds}
+        if job.kind == "start_instance":
+            response["instance"] = instances.instance_view(session, instances.find_for_job(session, job), now, timeout)
     return response
 
 
@@ -169,9 +185,11 @@ def close_job(session, job, now, policy, code, error, retryable):
 
 
 def report_job(session, worker_id, job_id, claim_id, outcome, result, error, clock=utc_now,
-               *, attempt_number, retryable=False, policy=None):
+               *, attempt_number, retryable=False, policy=None, instance_outcome=None, worker_timeout=15):
     policy = policy or JobPolicy()
     payload = {"outcome": outcome, "result": result, "error": error, "retryable": retryable}
+    if instance_outcome is not None:
+        payload["instance_outcome"] = instance_outcome
     with write_transaction(session):
         require_worker(session, worker_id)
         job = get_job(session, job_id)
@@ -184,6 +202,13 @@ def report_job(session, worker_id, job_id, claim_id, outcome, result, error, clo
             return attempt.report_ack
         now = clock()
         check_owner(job, attempt, worker_id, claim_id, now)
+        instance = None
+        if job.kind == "prepare_deployment" and instance_outcome is not None:
+            raise InvalidJobReport("Preparation jobs cannot report instance outcomes")
+        if job.kind == "start_instance":
+            if instance_outcome is None:
+                raise InvalidJobReport("Startup jobs require an instance outcome")
+            instance = instances.record_outcome(session, job, attempt, instance_outcome, now)
         if outcome == "completed":
             change_job(session, job, state="completed", finished_at=now, result=result,
                        error=None, assignment_expires_at=None, lease_expires_at=None)
@@ -192,6 +217,10 @@ def report_job(session, worker_id, job_id, claim_id, outcome, result, error, clo
             code = "retryable_failure" if retryable else "permanent_failure"
             close_job(session, job, now, policy, code, error, retryable)
         ack = {**snapshot(job), "acknowledged_attempt_number": attempt_number, "attempt_outcome": outcome}
+        if instance is not None:
+            view = instances.instance_view(session, instance, now, worker_timeout)
+            ack["instance"] = {key: value.isoformat() if isinstance(value, datetime) else value
+                               for key, value in view.items()}
         # Set all terminal history fields before the single flush; history is immutable afterwards.
         attempt.state = outcome
         attempt.finished_at = now
@@ -213,8 +242,11 @@ def recover_in_transaction(session, now, policy, limit=100):
     for job in expired:
         attempt = attempt_for(session, job.id, job.attempt_count)
         code = "assignment_expired" if job.state == "assigned" else "lease_expired"
+        claimed = job.state == "claimed"
         number = job.attempt_count
         close_job(session, job, now, policy, code, code.replace("_", " "), True)
+        if job.kind == "start_instance":
+            instances.record_failure(session, job, attempt, now, code, claimed)
         attempt.state = "expired"
         attempt.finished_at = now
         attempt.failure_code = code

@@ -4,7 +4,8 @@ A lightweight, self-hosted application deployment and orchestration platform.
 Milestone 1A implements FastAPI and SQLite persistence. Milestone 1B adds a separate
 HTTP worker agent, worker registration, and heartbeats. Milestone 1C-A adds persistent
 jobs, explicit basic scheduling, and opt-in simulated job processing. Milestone 1C-B
-adds numbered attempts, leases, retries, and explicit failure recovery. Docker,
+adds numbered attempts, leases, retries, and explicit failure recovery. Milestone 1D-A
+adds explicit simulated instance records and lifecycle management. Docker,
 application execution, and the frontend are future milestones.
 
 ## Windows PowerShell setup
@@ -119,13 +120,22 @@ with an error for operator correction. There is no retry limit for transient err
 | POST | `/workers/{id}/jobs/{job_id}/renew` | Renew a live lease using attempt, claim, and renewal UUID. |
 | GET | `/jobs/{id}/attempts` | Ordered assignment/claim/outcome history. |
 | POST | `/jobs/recover` | Recover up to 100 expired attempts without assigning new work. |
+| POST | `/deployments/{id}/instances` | Create one instance and startup job atomically; 201 new, 200 existing. |
+| GET | `/instances` | Inspect instances; filters `deployment_id`, `worker_id`, `state`; `limit` and `offset`. |
+| GET | `/instances/{uuid}` | Instance state, placement provenance, and derived worker availability. |
+| POST | `/instances/{uuid}/stop` | Version-checked simulated stop after startup work is terminal. |
 
 Worker registration accepts `{"identity":"laptop-worker-1"}`. Identity is case-sensitive,
 trimmed, and must be a string of 1–100 characters; extra fields return 422. A unique
 database constraint and atomic upsert prevent duplicate records, including simultaneous
 registrations. Re-registration preserves the worker ID and original registration time
 while refreshing its heartbeat. Heartbeat requests need no body and accept positive IDs.
-Clients do not supply timestamps or choose status.
+Clients do not supply timestamps or choose status. Registration optionally accepts
+`capabilities`, an array containing `prepare_deployment` and/or `start_instance`.
+Omission defaults to preparation-only for legacy compatibility. An empty array means
+no new job kinds are eligible. Re-registration updates capabilities without revoking
+an already-assigned or claimed job. Upgraded `--poll-jobs` agents advertise both kinds;
+heartbeat-only operation retains its previous behavior.
 
 Worker responses include `id`, `identity`, `registered_at`, `last_heartbeat_at`, and
 `status` (`available` or `unavailable`). Both timestamps are server-generated, timezone-aware
@@ -180,13 +190,16 @@ backend/control_plane/
   api/schemas.py           Pydantic input/output contracts
   api/workers.py           Worker HTTP endpoints
   api/jobs.py              Job, claim/report, and explicit scheduling endpoints
+  api/instances.py         Explicit instance creation, inspection, and stop
   services/applications.py Application and deployment operations
   services/workers.py      Registration, heartbeats, and availability calculation
   services/jobs.py         Durable claims, reports, queries, and write transactions
-  services/scheduling.py   Deterministic FIFO placement
+  services/scheduling.py   Capability-aware FIFO placement
+  services/instances.py    Instance transactions and lifecycle helpers
   persistence/models.py    SQLAlchemy entities and database constraints
   persistence/database.py  SQLite engine and request-scoped sessions
   persistence/migrations.py Versioned, transactional SQLite startup upgrades
+  persistence/schema_v3.py Frozen historical DDL for safe upgrades
 backend/worker/
   agent.py                 Separate HTTP client process and retry loop
   jobs.py                  Opt-in HTTP polling and fixed simulation handler
@@ -290,7 +303,8 @@ localhost; authentication and remote worker setup remain outside this milestone.
 
 ## Persistent jobs, attempts, and recovery
 
-A deployment and its one durable job are created together. Each assignment creates a
+A deployment and its preparation job are created together. Explicit instance creation
+adds a separate startup job; there is still exactly one preparation job per deployment. Each assignment creates a
 numbered `JobAttempt` and consumes one of the job's persisted `max_attempts`. HTTP
 retries consume no attempts. Jobs are current state; attempts preserve ownership,
 claim UUID, failure reason, and outcomes. Terminal attempts are immutable. A partial
@@ -306,7 +320,9 @@ application or changes deployment runtime status; new deployments remain pending
 All ownership mutations use short `BEGIN IMMEDIATE` transactions, sample UTC after
 acquiring the write reservation, and use conditional writes. Scheduling recovers a
 bounded batch first, then selects eligible queued jobs by `(next_run_at, created_at, id)`
-and fresh idle workers by ID, all inside the same transaction. One call may leave more
+and fresh idle compatible workers by ID, all inside the same transaction. Unsupported
+job kinds do not block compatible work later in the queue; queued jobs are scanned in
+bounded pages until the assignment limit is reached or the queue is exhausted. One call may leave more
 than 100 expirations for a subsequent call. SQLite serializes writers; lock contention
 can still fail a request, which workers retry as a server error.
 
@@ -563,3 +579,180 @@ the first claim expires, recovery releases it, the second worker claims the retr
 the stale owner gets 409, and the second completes with both attempts preserved and
 the deployment still pending. A separate regression verifies that a new claim resets
 renewal backoff accumulated by a previous attempt.
+
+## Instance records and lifecycle management (1D-A)
+
+Instances are explicit and simulated. Deployment creation and existing
+`prepare_deployment` jobs retain their previous behavior, including reports without
+instance fields. No existing job is repurposed. An instance is not inferred from a
+completed preparation job, and no instance is created automatically at startup.
+
+`POST /deployments/{id}/instances` accepts an empty body or `{}`. It creates a stable
+UUID instance and one `start_instance` job together under `BEGIN IMMEDIATE`. SQLite
+uniquely constrains the deployment and startup-job relationships. Concurrent requests
+produce one record/job. Repeated creation returns the existing instance without
+resetting state, ownership, or retry budgets, including after failure or stop.
+
+The instance stores deployment/startup-job IDs, most recent worker and attempt IDs,
+state, version, creation/update timestamps, last worker observation, healthy/stop
+timestamps, source, and reason. All times use aware UTC at the Python/API boundary.
+The worker ID is placement provenance, not proof of an existing application process.
+
+Allowed transitions:
+
+| Transition | Authority |
+| --- | --- |
+| pending -> starting | Control plane accepts a live first startup claim. |
+| pending -> failed | Unclaimed startup assignments exhaust the retry budget. |
+| starting -> healthy | Current lease owner reports successful simulated readiness. |
+| starting -> failed | Startup/readiness failure or control-plane lease recovery. |
+| failed -> starting | A valid retry claim, keeping the same UUID. |
+| healthy/failed -> stopped | Explicit manual simulated stop after startup work is terminal. |
+
+A successful claim sets starting, not healthy. The worker executes a fixed startup
+simulation and a separate fixed readiness phase, then reports. Specifications are
+never interpreted as commands. There are no processes, containers, real probes,
+sleeps to simulate applications, replicas, or replacement instances.
+
+Startup polling includes `instance_id` and `instance_version`; the claim response
+includes the updated `instance` snapshot. A startup report must include:
+
+```json
+{
+  "attempt_number": 1,
+  "claim_id": "<UUID>",
+  "outcome": "completed",
+  "result": {"simulated": true},
+  "instance_outcome": {
+    "instance_id": "<instance UUID>",
+    "expected_version": 3,
+    "state": "healthy",
+    "phase": "readiness_passed"
+  }
+}
+```
+
+Use the version from the claim response, not the earlier polling response. A failed
+startup report instead uses outcome/state failed, a bounded error, and phase
+`startup_failed` or `readiness_failed`; existing retryable failure policy applies.
+Preparation jobs cannot report instance outcomes. Job/instance outcome mismatches
+and missing required startup observations return 422. Expired claims, wrong workers,
+stale attempts, instance mismatches, and stale versions return 409.
+
+Within one write transaction the control plane validates job/attempt/worker/claim,
+lease, instance linkage and version, updates the instance, closes the job and attempt,
+and stores the historical acknowledgment. Failure rolls back all of them. Replayed
+accepted reports return the original job and instance snapshots without changing
+current state, even after stop. The lease is not an ongoing health-reporting credential
+once the startup job completes.
+
+Inspection includes persisted state plus `simulated`, `worker_available`,
+`startup_job_state`, `current_worker_id`, `current_attempt_number`, and `ownership_valid`.
+Derived availability is not persisted. A healthy instance on an unavailable worker
+stays last-known healthy; its observation timestamp and worker reachability explain
+the uncertainty. Expiration recovery records startup ownership failure, not proof a
+process terminated. Assignment expiry leaves pending/previously failed state until
+retry exhaustion. Deployment runtime status is never changed by instance operations.
+
+`POST /instances/{uuid}/stop` requires `{"expected_version":<integer>}`. It accepts
+healthy/failed instances only after the startup job is completed or terminally failed.
+Pending, starting, and queued-retry startup operations return 409. An already-stopped
+instance returns its unchanged record for an idempotent retry. No active job is
+cancelled. Stopped is terminal in 1D-A; creation does not restart it.
+
+### Migration version 4
+
+The current jobs schema permits `start_instance` and replaces global deployment-job
+uniqueness with a partial unique index for preparation jobs. Version 4 stages jobs,
+attempts, and renewal receipts in transaction-local SQLite tables, drops children
+before their parent, then recreates/restores the parent before children. Original
+IDs and raw serialized report acknowledgments are preserved. Foreign keys remain
+enabled. The new instance table is created only after restoration, and foreign-key
+integrity is checked before recording version 4.
+
+Workers receive a preparation-only capabilities default. Historical version 3 DDL
+is frozen in `schema_v3.py`, so older migrations do not silently use the new model.
+Instances are not backfilled and existing live deadlines are not extended. Repeated
+startup is a no-op. Injected failures at child removal, parent restoration, and version
+recording verify complete rollback, including original triggers and indexes.
+
+Tests cover versions 1/2/3, active assignments/claims, terminal outcomes and accepted
+reports, renewal receipts, concurrent upgrades, repeat startup, and foreign-key
+integrity. Tests use temporary files. Your existing development database is upgraded
+only when you start the new API; it is never deleted or reset. Stop old API/agents
+before upgrading. No new dependency was introduced.
+
+### Quick manual instance lifecycle in two PowerShell terminals
+
+Terminal 1 starts a fresh ignored manual-test database, preserving development data:
+
+```powershell
+Set-Location C:\Projects\mini-cloud-1
+$env:MINI_CLOUD_DATABASE_PATH = Join-Path $PWD ("var\manual-1da-{0}.db" -f [guid]::NewGuid().ToString("N"))
+.\.venv\Scripts\python.exe -m uvicorn backend.control_plane.main:app --host 127.0.0.1 --port 8000
+```
+
+Terminal 2 creates an instance and uses a startup-only worker identity so queued
+preparation work does not consume its first assignment:
+
+```powershell
+Set-Location C:\Projects\mini-cloud-1
+$base = "http://127.0.0.1:8000"
+function Post-Json($path, $body = $null) {
+    $options = @{ Method = 'Post'; Uri = "$base$path" }
+    if ($null -ne $body) {
+        $options.ContentType = 'application/json'
+        $options.Body = $body | ConvertTo-Json -Depth 10
+    }
+    Invoke-RestMethod @options
+}
+$app = Post-Json '/applications' @{ name = 'instance-demo' }
+$dep = Post-Json "/applications/$($app.id)/deployments" @{ specification = @{ simulated = $true } }
+$instance = Post-Json "/deployments/$($dep.id)/instances"
+Post-Json "/deployments/$($dep.id)/instances" | Format-List
+$worker = Post-Json '/workers/register' @{ identity = 'instance-demo'; capabilities = @('start_instance') }
+Post-Json '/scheduling/run' | ConvertTo-Json -Depth 5
+Invoke-RestMethod "$base/workers/$($worker.id)/jobs" | ConvertTo-Json -Depth 5
+$claim = @{ attempt_number = 1; claim_id = [guid]::NewGuid().ToString() }
+Post-Json "/workers/$($worker.id)/heartbeat" | Out-Null
+$grant = Post-Json "/workers/$($worker.id)/jobs/$($instance.start_job_id)/claim" $claim
+$grant.instance | Format-List
+$report = @{} + $claim + @{
+    outcome = 'completed'
+    result = @{ simulated = $true }
+    instance_outcome = @{
+        instance_id = $instance.id
+        expected_version = $grant.instance.version
+        state = 'healthy'
+        phase = 'readiness_passed'
+    }
+}
+$accepted = Post-Json "/workers/$($worker.id)/jobs/$($instance.start_job_id)/report" $report
+$accepted.instance | Format-List
+$stopped = Post-Json "/instances/$($instance.id)/stop" @{ expected_version = $accepted.instance.version }
+$stopped | Format-List
+# Historical acknowledgment still describes healthy; it does not undo the stop.
+Post-Json "/workers/$($worker.id)/jobs/$($instance.start_job_id)/report" $report | ConvertTo-Json -Depth 8
+Invoke-RestMethod "$base/instances/$($instance.id)" | Format-List
+Invoke-RestMethod "$base/deployments" | Format-Table id, runtime_status
+```
+
+Run scheduling and claiming promptly (15-second assignment window), then report within
+the 30-second lease or renew it using the existing renewal endpoint. To exercise the
+Python handler instead of manual claims, create another deployment and instance,
+run an upgraded worker with `--poll-jobs`, and explicitly invoke scheduling. That worker
+advertises both kinds; preparation may run first and another explicit scheduling call
+may be needed for startup. Scheduling never runs inside the worker or a FastAPI loop.
+
+### Boundaries and remaining limitations
+
+One instance per deployment, one active job per worker, and one startup job per instance
+are intentional first-slice limits. Healthy instances do not consume active job slots;
+this is not runtime resource accounting. There is no continuous health monitor,
+active-start cancellation, restart of stopped instances, desired replica count,
+reconciliation loop, or automatic replacement. Those policies need the 1D-B design.
+
+Only localhost development is supported; capabilities and claim UUIDs are not worker
+authentication. API fencing cannot prevent stale external side effects once real
+execution exists. Existing synchronous HTTP timing, explicit recovery/scheduling,
+process-local claims, clock-jump, and history-retention limitations still apply.

@@ -10,6 +10,7 @@ from fastapi import FastAPI
 from backend.control_plane.api.routes import router
 from backend.control_plane.api.workers import router as worker_router
 from backend.control_plane.api.jobs import router as job_router
+from backend.control_plane.api.instances import router as instance_router
 from backend.control_plane.persistence.database import DEFAULT_DATABASE_PATH, create_database_engine
 from backend.control_plane.persistence.migrations import initialize_database
 from backend.control_plane.job_policy import JobPolicy
@@ -45,6 +46,7 @@ def create_app(
     app.include_router(router)
     app.include_router(worker_router)
     app.include_router(job_router)
+    app.include_router(instance_router)
     return app
 
 

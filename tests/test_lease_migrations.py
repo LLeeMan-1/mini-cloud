@@ -7,6 +7,7 @@ from sqlalchemy import event, select
 
 from backend.control_plane.main import create_app
 from backend.control_plane.persistence.database import create_database_engine
+from backend.control_plane.persistence import schema_v3
 from backend.control_plane.persistence.migrations import create_version_two_jobs, initialize_database
 from backend.control_plane.persistence.models import Application, Deployment, Worker, Job
 
@@ -17,8 +18,9 @@ def v2(tmp_path):
     engine = create_database_engine(path)
     claims = {state: str(uuid4()) for state in ("claimed", "completed", "failed")}
     with engine.begin() as connection:
-        for table in (Application.__table__, Deployment.__table__, Worker.__table__):
+        for table in (Application.__table__, Deployment.__table__):
             table.create(connection)
+        schema_v3.create_table(connection, "workers")
         create_version_two_jobs(connection)
         connection.exec_driver_sql("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY)")
         connection.exec_driver_sql("INSERT INTO schema_migrations VALUES (1), (2)")
@@ -54,8 +56,9 @@ def test_v3_preserves_all_job_states_and_terminal_report_acknowledgments(v2):
     initialize_database(engine, clock=lambda: now)
     with engine.connect() as connection:
         after = old_snapshot(connection)
-        for table in ("applications", "deployments", "workers"):
+        for table in ("applications", "deployments"):
             assert after[table] == before[table]
+        assert [row[:4] for row in after["workers"]] == before["workers"]
         assert [row[:12] for row in after["jobs"]] == before["jobs"]
         rows = connection.execute(select(Job)).mappings().all()
         assert rows[0]["attempt_count"] == 0
