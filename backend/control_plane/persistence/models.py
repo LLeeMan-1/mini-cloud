@@ -59,6 +59,29 @@ class UTCDateTime(TypeDecorator):
         return value.replace(tzinfo=timezone.utc) if value is not None else None
 
 
+class DeploymentTarget(Base):
+    __tablename__ = "deployment_targets"
+    __table_args__ = (
+        CheckConstraint("typeof(desired_replicas) = 'integer' AND desired_replicas BETWEEN 0 AND 100",
+                        name="bounded_replica_target"),
+        CheckConstraint("version > 0", name="positive_target_version"),
+    )
+
+    deployment_id: Mapped[int] = mapped_column(ForeignKey("deployments.id"), primary_key=True)
+    desired_replicas: Mapped[int] = mapped_column(default=1)
+    version: Mapped[int] = mapped_column(default=1)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now)
+
+
+event.listen(DeploymentTarget.__table__, "after_create", DDL("""
+    CREATE TRIGGER targets_valid_update BEFORE UPDATE ON deployment_targets
+    WHEN NEW.deployment_id != OLD.deployment_id OR NEW.created_at != OLD.created_at
+      OR NEW.version != OLD.version + 1 OR NEW.desired_replicas <= OLD.desired_replicas
+    BEGIN SELECT RAISE(ABORT, 'invalid replica target mutation'); END
+""").execute_if(dialect="sqlite"))
+
+
 class Worker(Base):
     __tablename__ = "workers"
 
@@ -175,6 +198,8 @@ class JobRenewal(Base):
 class Instance(Base):
     __tablename__ = "instances"
     __table_args__ = (
+        UniqueConstraint("deployment_id", "replica_index", name="unique_replica_slot"),
+        CheckConstraint("typeof(replica_index) = 'integer' AND replica_index >= 0", name="valid_replica_index"),
         CheckConstraint("state IN ('pending','starting','healthy','failed','stopped')", name="valid_instance_state"),
         CheckConstraint("version > 0", name="positive_instance_version"),
         CheckConstraint("state_source IN ('control_plane','worker_report','manual')", name="valid_instance_source"),
@@ -183,7 +208,8 @@ class Instance(Base):
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
-    deployment_id: Mapped[int] = mapped_column(ForeignKey("deployments.id"), unique=True)
+    deployment_id: Mapped[int] = mapped_column(ForeignKey("deployments.id"))
+    replica_index: Mapped[int] = mapped_column(default=0)
     start_job_id: Mapped[int] = mapped_column(ForeignKey("jobs.id"), unique=True)
     worker_id: Mapped[int | None] = mapped_column(ForeignKey("workers.id"))
     last_attempt_id: Mapped[int | None] = mapped_column(ForeignKey("job_attempts.id"))
@@ -201,6 +227,7 @@ class Instance(Base):
 event.listen(Instance.__table__, "after_create", DDL("""
     CREATE TRIGGER instances_valid_transition BEFORE UPDATE ON instances
     WHEN NEW.id != OLD.id OR NEW.deployment_id != OLD.deployment_id OR NEW.start_job_id != OLD.start_job_id
+      OR NEW.replica_index != OLD.replica_index
       OR NEW.created_at != OLD.created_at OR NEW.version != OLD.version + 1
       OR (NEW.state != OLD.state AND NOT (
         (OLD.state='pending' AND NEW.state IN ('starting','failed')) OR

@@ -2,7 +2,7 @@
 
 from sqlalchemy import select, update
 
-from backend.control_plane.persistence.models import Deployment, Instance, Job, Worker, utc_now
+from backend.control_plane.persistence.models import Instance, Job, Worker, utc_now
 
 
 def find_for_job(session, job):
@@ -60,22 +60,31 @@ def instance_view(session, instance, now, timeout):
 
 
 def create_instance(session, deployment_id, policy, clock=utc_now):
-    from backend.control_plane.services.jobs import RecordNotFound, write_transaction
+    from backend.control_plane.services.jobs import JobConflict, write_transaction
+    from backend.control_plane.services.replicas import get_target, inspect_slots
     with write_transaction(session):
-        if session.get(Deployment, deployment_id) is None:
-            raise RecordNotFound("Deployment not found")
-        instance = session.scalar(select(Instance).where(Instance.deployment_id == deployment_id))
-        if instance is not None:
-            return instance, False
-        now = clock()
-        job = Job(deployment_id=deployment_id, kind="start_instance", state="queued",
-                  max_attempts=policy.max_attempts, created_at=now, next_run_at=now)
-        session.add(job)
-        session.flush()
-        instance = Instance(deployment_id=deployment_id, start_job_id=job.id,
-                            created_at=now, updated_at=now)
-        session.add(instance)
-        session.flush()
+        target = get_target(session, deployment_id)
+        inspect_slots(session, target)
+        if target.desired_replicas == 0:
+            raise JobConflict("Deployment has no desired replica", "no_desired_replica")
+        instance, created = ensure_slot(session, deployment_id, 0, policy, clock())
+    return instance, created
+
+
+def ensure_slot(session, deployment_id, replica_index, policy, now):
+    """Caller must hold the write transaction and validate target/slot integrity."""
+    instance = session.scalar(select(Instance).where(
+        Instance.deployment_id == deployment_id, Instance.replica_index == replica_index))
+    if instance is not None:
+        return instance, False
+    job = Job(deployment_id=deployment_id, kind="start_instance", state="queued",
+              max_attempts=policy.max_attempts, created_at=now, next_run_at=now)
+    session.add(job)
+    session.flush()
+    instance = Instance(deployment_id=deployment_id, replica_index=replica_index, start_job_id=job.id,
+                        created_at=now, updated_at=now)
+    session.add(instance)
+    session.flush()
     return instance, True
 
 

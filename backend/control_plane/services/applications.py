@@ -7,7 +7,8 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from backend.control_plane.persistence.models import Application, Deployment, Job, utc_now
+from backend.control_plane.persistence.models import Application, Deployment, DeploymentTarget, Job, utc_now
+from backend.control_plane.services.jobs import write_transaction
 
 
 class ApplicationNotFound(Exception):
@@ -29,20 +30,23 @@ def list_applications(session: Session) -> list[Application]:
 def create_deployment(
     session: Session, application_id: int, specification: dict[str, Any], max_attempts: int = 3,
     now: datetime | None = None,
+    *, desired_replicas: int = 1,
 ) -> Deployment:
-    if session.get(Application, application_id) is None:
-        raise ApplicationNotFound(application_id)
-    deployment = Deployment(
-        application_id=application_id,
-        specification=deepcopy(specification),
-        runtime_status="pending",
-        created_at=now or utc_now(),
-    )
-    session.add(deployment)
-    session.flush()
-    session.add(Job(deployment_id=deployment.id, max_attempts=max_attempts,
-                    next_run_at=deployment.created_at, created_at=deployment.created_at))
-    session.commit()
+    with write_transaction(session):
+        if session.get(Application, application_id) is None:
+            raise ApplicationNotFound(application_id)
+        deployment = Deployment(
+            application_id=application_id,
+            specification=deepcopy(specification),
+            runtime_status="pending",
+            created_at=now or utc_now(),
+        )
+        session.add(deployment)
+        session.flush()
+        session.add(DeploymentTarget(deployment_id=deployment.id, desired_replicas=desired_replicas,
+                                     created_at=deployment.created_at, updated_at=deployment.created_at))
+        session.add(Job(deployment_id=deployment.id, max_attempts=max_attempts,
+                        next_run_at=deployment.created_at, created_at=deployment.created_at))
     session.refresh(deployment)
     return deployment
 

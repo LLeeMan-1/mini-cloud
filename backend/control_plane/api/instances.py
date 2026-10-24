@@ -21,7 +21,7 @@ def create_instance(
         instance, created = instances.create_instance(session, deployment_id, request.app.state.job_policy, clock)
         response.status_code = 201 if created else 200
         return instances.instance_view(session, instance, clock(), request.app.state.worker_timeout)
-    except jobs.RecordNotFound as error:
+    except (jobs.RecordNotFound, jobs.JobConflict) as error:
         raise translate_error(error) from None
 
 

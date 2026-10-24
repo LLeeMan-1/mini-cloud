@@ -2,15 +2,15 @@
 
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import select
+from sqlalchemy import literal, select
 from sqlalchemy.engine import Engine
 
-from backend.control_plane.persistence.models import Application, Deployment, Worker, Job, JobAttempt, JobRenewal, Instance, utc_now
-from backend.control_plane.persistence import schema_v3
+from backend.control_plane.persistence.models import Application, Deployment, Worker, Job, JobAttempt, JobRenewal, Instance, DeploymentTarget, utc_now
+from backend.control_plane.persistence import schema_v3, schema_v4
 from backend.control_plane.job_policy import JobPolicy
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 def create_version_two_jobs(connection):
@@ -80,16 +80,37 @@ def upgrade_instances_v4(connection):
     for table in reversed(tables):
         connection.exec_driver_sql(f"DROP TABLE {table.name}")
     for table in tables:
-        table.create(connection)
+        schema_v4.create_table(connection, table.name)
         columns = ", ".join(column.name for column in table.columns)
         connection.exec_driver_sql(f"INSERT INTO {table.name} ({columns}) SELECT {columns} FROM v4_{table.name}")
         connection.exec_driver_sql(f"DROP TABLE temp.v4_{table.name}")
     columns = connection.exec_driver_sql("PRAGMA table_info(workers)").all()
     if not any(column[1] == "capabilities" for column in columns):
         connection.exec_driver_sql("""ALTER TABLE workers ADD COLUMN capabilities JSON NOT NULL DEFAULT '["prepare_deployment"]'""")
-    Instance.__table__.create(connection)
+    schema_v4.create_table(connection, "instances")
     if connection.exec_driver_sql("PRAGMA foreign_key_check").all():
         raise RuntimeError("Foreign-key integrity check failed during version 4 migration")
+
+
+def upgrade_replicas_v5(connection, now):
+    DeploymentTarget.__table__.create(connection)
+    connection.execute(DeploymentTarget.__table__.insert().from_select(
+        ["deployment_id", "desired_replicas", "version", "created_at", "updated_at"],
+        select(Deployment.id, literal(1), literal(1),
+               literal(now, type_=DeploymentTarget.created_at.type),
+               literal(now, type_=DeploymentTarget.updated_at.type)),
+        include_defaults=False,
+    ))
+    connection.exec_driver_sql("CREATE TEMP TABLE v5_instances AS SELECT * FROM instances")
+    connection.exec_driver_sql("DROP TABLE instances")
+    Instance.__table__.create(connection)
+    columns = ", ".join(column.name for column in Instance.__table__.columns)
+    restored = ", ".join("0" if column.name == "replica_index" else column.name
+                         for column in Instance.__table__.columns)
+    connection.exec_driver_sql(f"INSERT INTO instances ({columns}) SELECT {restored} FROM v5_instances")
+    connection.exec_driver_sql("DROP TABLE temp.v5_instances")
+    if connection.exec_driver_sql("PRAGMA foreign_key_check").all():
+        raise RuntimeError("Foreign-key integrity check failed during version 5 migration")
 
 
 def initialize_database(engine: Engine, policy: JobPolicy | None = None, clock=utc_now) -> None:
@@ -153,6 +174,9 @@ def initialize_database(engine: Engine, policy: JobPolicy | None = None, clock=u
             if version < 4:
                 upgrade_instances_v4(connection)
                 connection.exec_driver_sql("INSERT INTO schema_migrations (version) VALUES (4)")
+            if version < 5:
+                upgrade_replicas_v5(connection, clock())
+                connection.exec_driver_sql("INSERT INTO schema_migrations (version) VALUES (5)")
             connection.commit()
         except BaseException:
             connection.rollback()

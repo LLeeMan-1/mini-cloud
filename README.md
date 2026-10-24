@@ -5,7 +5,8 @@ Milestone 1A implements FastAPI and SQLite persistence. Milestone 1B adds a sepa
 HTTP worker agent, worker registration, and heartbeats. Milestone 1C-A adds persistent
 jobs, explicit basic scheduling, and opt-in simulated job processing. Milestone 1C-B
 adds numbered attempts, leases, retries, and explicit failure recovery. Milestone 1D-A
-adds explicit simulated instance records and lifecycle management. Docker,
+adds explicit simulated instance records and lifecycle management. Milestone 1D-B1
+adds replica targets and explicit, create-only desired-state reconciliation. Docker,
 application execution, and the frontend are future milestones.
 
 ## Windows PowerShell setup
@@ -120,7 +121,10 @@ with an error for operator correction. There is no retry limit for transient err
 | POST | `/workers/{id}/jobs/{job_id}/renew` | Renew a live lease using attempt, claim, and renewal UUID. |
 | GET | `/jobs/{id}/attempts` | Ordered assignment/claim/outcome history. |
 | POST | `/jobs/recover` | Recover up to 100 expired attempts without assigning new work. |
-| POST | `/deployments/{id}/instances` | Create one instance and startup job atomically; 201 new, 200 existing. |
+| POST | `/deployments/{id}/instances` | Idempotently create slot 0 and its startup job; 201 new, 200 existing, 409 for a zero target. |
+| GET | `/deployments/{id}/replicas` | Replica target, version, slot counts, missing indexes, and blocked slots. |
+| PUT | `/deployments/{id}/replicas` | Version-checked target increase; no instance creation. |
+| POST | `/deployments/{id}/reconcile` | Explicitly create missing replica slots and startup jobs atomically. |
 | GET | `/instances` | Inspect instances; filters `deployment_id`, `worker_id`, `state`; `limit` and `offset`. |
 | GET | `/instances/{uuid}` | Instance state, placement provenance, and derived worker availability. |
 | POST | `/instances/{uuid}/stop` | Version-checked simulated stop after startup work is terminal. |
@@ -589,7 +593,8 @@ completed preparation job, and no instance is created automatically at startup.
 
 `POST /deployments/{id}/instances` accepts an empty body or `{}`. It creates a stable
 UUID instance and one `start_instance` job together under `BEGIN IMMEDIATE`. SQLite
-uniquely constrains the deployment and startup-job relationships. Concurrent requests
+uniquely constrains the deployment/replica-index and startup-job relationships. This
+endpoint always manages slot 0; reconciliation creates the other desired slots. Concurrent requests
 produce one record/job. Repeated creation returns the existing instance without
 resetting state, ownership, or retry budgets, including after failure or stop.
 
@@ -612,7 +617,7 @@ Allowed transitions:
 A successful claim sets starting, not healthy. The worker executes a fixed startup
 simulation and a separate fixed readiness phase, then reports. Specifications are
 never interpreted as commands. There are no processes, containers, real probes,
-sleeps to simulate applications, replicas, or replacement instances.
+sleeps to simulate applications, or replacement instances.
 
 Startup polling includes `instance_id` and `instance_version`; the claim response
 includes the updated `instance` snapshot. A startup report must include:
@@ -746,13 +751,156 @@ may be needed for startup. Scheduling never runs inside the worker or a FastAPI 
 
 ### Boundaries and remaining limitations
 
-One instance per deployment, one active job per worker, and one startup job per instance
-are intentional first-slice limits. Healthy instances do not consume active job slots;
+One instance per replica slot, one active job per worker, and one startup job per instance
+are intentional limits. Healthy instances do not consume active job slots;
 this is not runtime resource accounting. There is no continuous health monitor,
-active-start cancellation, restart of stopped instances, desired replica count,
-reconciliation loop, or automatic replacement. Those policies need the 1D-B design.
+active-start cancellation, restart of stopped instances, background reconciliation,
+scale-down, or automatic replacement. Those policies need the 1D-B2 design.
 
 Only localhost development is supported; capabilities and claim UUIDs are not worker
 authentication. API fencing cannot prevent stale external side effects once real
 execution exists. Existing synchronous HTTP timing, explicit recovery/scheduling,
 process-local claims, clock-jump, and history-retention limitations still apply.
+
+## Replica modeling and explicit reconciliation (1D-B1)
+
+Replica intent lives in `deployment_targets`, separately from immutable deployment
+specifications. Deployment creation accepts optional top-level `desired_replicas`
+(strict integer 0 through 100, default 1). It atomically creates the deployment,
+version-1 target, and existing preparation job. It does not create instances.
+Arbitrary `specification.replicas` values have no orchestration meaning.
+
+`GET /deployments/{id}/replicas` returns target timestamps/version, materialized
+count, missing indexes, lifecycle counts, retrying count, expired ownership count,
+unavailable-worker count, and blocked slots. Reachability counts overlap lifecycle
+counts: an unavailable worker can still have a last-known healthy instance.
+There is no claim that these counts represent current real application health.
+
+`PUT /deployments/{id}/replicas` accepts:
+
+```json
+{"desired_replicas": 3, "expected_version": 1}
+```
+
+An increase increments the target version and update timestamp; an unchanged value
+with the current version is a no-op. Stale versions return structured 409
+`target_version_conflict`; decreases return 409 `scale_down_not_supported`.
+For a lost update response, GET the target to confirm the requested value before
+retrying. Zero is supported on creation and can later increase. PUT does not
+reconcile or schedule. Invalid counts (including booleans, fractions, and numeric
+strings), versions, and extra fields return 422. Missing deployments return 404.
+SQLite write contention returns retryable 503 `database_busy` with `Retry-After: 1`.
+
+`POST /deployments/{id}/reconcile` takes no body. Under one short `BEGIN IMMEDIATE`
+transaction it reads the target and validates persistent slot/job relationships,
+then creates missing indexes in ascending order. Each receives a stable UUID and
+one queued `start_instance` job. Response fields are `deployment_id`,
+`target_version`, `desired_replicas`, `created_count`, `created` (index, instance ID,
+startup-job ID), and `blocked` (the same identity fields plus a reason).
+Concurrent calls serialize and SQLite enforces unique `(deployment_id, replica_index)`.
+The legacy empty-body instance-creation endpoint shares the helper and manages only
+slot 0; it returns 409 `no_desired_replica` for a zero target.
+
+Every existing slot counts as materialized, including pending, starting, healthy,
+failed, and stopped. Queued/retrying jobs are retained with their existing retry
+budget. Terminal startup failure and stopped slots are returned as blocked with
+reasons `terminal_startup_failure` and `stopped`. Expired assignments/leases are
+inspected without recovery. Inconsistent slot/job/attempt relationships return
+409 `replica_integrity_conflict` and roll back all work; they are never repaired
+silently. Repeated reconciliation creates zero additional work. It does not change
+existing instance versions, observations, jobs, attempts, or report receipts.
+
+Use the existing explicit `/jobs/recover` and `/scheduling/run` separately.
+Scheduling, worker capabilities, leases, retry delays, claim IDs, and fencing are
+unchanged. Workers use the same HTTP startup/readiness protocol. A stopped replica
+is not replaced, and an unreachable worker does not cause replacement or downgrade
+last-known instance health. Deployment runtime status stays pending.
+
+### Migration version 5
+
+Historical v4 jobs, attempts, renewal receipts, and instance DDL are frozen in
+`persistence/schema_v4.py`. Version 5 adds a default target of 1 to each existing
+deployment and rebuilds only instances, mapping existing records to slot 0.
+It preserves UUIDs, states, versions, timestamps, placement, job/attempt IDs, lease
+deadlines, raw payloads, and acknowledgment JSON. No instances are fabricated for
+deployments that lack them. Slot index becomes immutable; the old unique
+deployment constraint becomes a unique deployment/index constraint.
+
+The upgrade and foreign-key check run in the existing serialized migration
+transaction. Tests verify rollback after interrupted DDL/restoration/version
+recording, concurrent startups, and repeated startup. Old receipts omit
+`replica_index`; response validation accepts its absence and historical HTTP replay
+preserves the original serialized acknowledgment, including after a stop.
+
+Stop old API/worker processes before upgrading. Do not delete/reset any database.
+Starting the new API upgrades only the database selected by its configuration.
+Tests use temporary databases; no migration package or other dependency was added.
+
+### Manual replica demonstration
+
+Terminal 1 starts a fresh isolated database (choose a free port if another API is running):
+
+```powershell
+Set-Location C:\Projects\mini-cloud-1
+$env:MINI_CLOUD_DATABASE_PATH = Join-Path $PWD ("var\manual-1db1-{0}.db" -f [guid]::NewGuid().ToString("N"))
+.\.venv\Scripts\python.exe -m uvicorn backend.control_plane.main:app --host 127.0.0.1 --port 8000
+```
+
+Terminal 2 creates and reconciles three replicas:
+
+```powershell
+Set-Location C:\Projects\mini-cloud-1
+$base = 'http://127.0.0.1:8000'
+function Send-Json($method, $path, $body = $null) {
+    $options = @{ Method = $method; Uri = "$base$path" }
+    if ($null -ne $body) {
+        $options.ContentType = 'application/json'
+        $options.Body = $body | ConvertTo-Json -Depth 15
+    }
+    Invoke-RestMethod @options
+}
+$app = Send-Json Post '/applications' @{ name = 'replica-demo' }
+$dep = Send-Json Post "/applications/$($app.id)/deployments" @{
+    specification = @{ simulated = $true }; desired_replicas = 3
+}
+$first = Send-Json Post "/deployments/$($dep.id)/reconcile"
+$first | ConvertTo-Json -Depth 8
+Send-Json Post "/deployments/$($dep.id)/reconcile" | ConvertTo-Json -Depth 8
+Invoke-RestMethod "$base/instances?deployment_id=$($dep.id)" | Format-Table id, replica_index, state, version
+```
+
+The first call creates indexes 0, 1, 2; the second creates none. In another VS Code
+terminal start an opted-in agent (optionally use a fourth terminal for worker-2):
+
+```powershell
+Set-Location C:\Projects\mini-cloud-1
+.\.venv\Scripts\python.exe -m backend.worker.agent --identity replica-worker-1 --api-url http://127.0.0.1:8000 --poll-jobs
+```
+
+Back in Terminal 2, explicitly schedule, inspect, and increase the target:
+
+```powershell
+Send-Json Post '/scheduling/run' | ConvertTo-Json -Depth 8
+Invoke-RestMethod "$base/instances?deployment_id=$($dep.id)" | Format-Table replica_index, state, version, worker_available
+# Repeat scheduling after each job completes: preparation may run first, and
+# each worker can own only one assigned/claimed startup job at a time.
+Send-Json Post '/scheduling/run' | ConvertTo-Json -Depth 8
+$target = Invoke-RestMethod "$base/deployments/$($dep.id)/replicas"
+Send-Json Put "/deployments/$($dep.id)/replicas" @{
+    desired_replicas = 4; expected_version = $target.version
+} | Format-List
+Send-Json Post "/deployments/$($dep.id)/reconcile" | ConvertTo-Json -Depth 8
+Invoke-RestMethod "$base/deployments/$($dep.id)/replicas" | ConvertTo-Json -Depth 8
+Invoke-RestMethod "$base/deployments" | Format-Table id, runtime_status
+```
+
+The increase creates only index 3. After an instance becomes healthy, exercise the
+existing stop endpoint with its current version and reconcile again: the stopped
+slot remains blocked and is not replaced. Stop a worker and wait beyond the
+heartbeat timeout: reachability changes while last-known lifecycle state remains.
+
+B2 will define scale-down, cancellation, replacement generations, and unreachable
+worker policies. There is no reconciliation loop, automatic replacement, Docker,
+or real process execution. API fencing does not guarantee exactly-once external
+execution. Healthy replicas do not consume startup job slots or imply runtime
+resource capacity; one worker can simulate several startups sequentially.

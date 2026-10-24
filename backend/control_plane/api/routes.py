@@ -38,7 +38,8 @@ def create_deployment(
 ):
     try:
         return applications.create_deployment(session, id, body.specification,
-                                               request.app.state.job_policy.max_attempts, now)
+                                               request.app.state.job_policy.max_attempts, now,
+                                               desired_replicas=body.desired_replicas)
     except applications.ApplicationNotFound:
         raise HTTPException(status_code=404, detail="Application not found") from None
 

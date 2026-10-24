@@ -75,7 +75,7 @@ def test_legacy_upgrade_preserves_data_constraints_and_trigger(legacy_database):
             "SELECT sql FROM sqlite_master WHERE name = 'workers'"
         ).scalar_one()
         assert "valid_worker_status" not in table_sql
-        assert connection.exec_driver_sql("SELECT version FROM schema_migrations ORDER BY version").all() == [(1,), (2,), (3,), (4,)]
+        assert connection.exec_driver_sql("SELECT version FROM schema_migrations ORDER BY version").all() == [(1,), (2,), (3,), (4,), (5,)]
     with engine.begin() as connection:
         with pytest.raises(IntegrityError, match="specification is immutable"):
             connection.exec_driver_sql("UPDATE deployments SET specification = '{}' WHERE id = 9")
@@ -143,7 +143,7 @@ def test_simultaneous_startups_serialize_migration(legacy_database):
     with ThreadPoolExecutor(max_workers=3) as executor:
         list(executor.map(startup, range(3)))
     with engine.connect() as connection:
-        assert connection.exec_driver_sql("SELECT version FROM schema_migrations ORDER BY version").all() == [(1,), (2,), (3,), (4,)]
+        assert connection.exec_driver_sql("SELECT version FROM schema_migrations ORDER BY version").all() == [(1,), (2,), (3,), (4,), (5,)]
         assert connection.exec_driver_sql("SELECT id FROM workers ORDER BY id").all() == [(7,), (12,)]
         assert "status" not in [row[1] for row in connection.exec_driver_sql("PRAGMA table_info(workers)")]
 
@@ -203,7 +203,7 @@ def test_version_two_backfills_only_pending_and_preserves_all_records(version_on
         assert connection.exec_driver_sql(
             "SELECT deployment_id, state, created_at FROM jobs"
         ).all() == [(1, 'queued', '2026-10-14 00:00:00.000000')]
-        assert connection.exec_driver_sql("SELECT version FROM schema_migrations ORDER BY version").all() == [(1,), (2,), (3,), (4,)]
+        assert connection.exec_driver_sql("SELECT version FROM schema_migrations ORDER BY version").all() == [(1,), (2,), (3,), (4,), (5,)]
 
 
 def test_version_two_failure_rolls_back_and_can_retry(version_one_database):

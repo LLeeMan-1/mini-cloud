@@ -13,6 +13,7 @@ ApplicationName = Annotated[
 ]
 JobKind = Literal["prepare_deployment", "start_instance"]
 InstanceState = Literal["pending", "starting", "healthy", "failed", "stopped"]
+ReplicaCount = Annotated[int, Field(strict=True, ge=0, le=100)]
 
 
 class ApplicationCreate(BaseModel):
@@ -26,6 +27,7 @@ class DeploymentCreate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     specification: dict[str, JsonValue] = Field(min_length=1)
+    desired_replicas: ReplicaCount = 1
 
 
 class StoredRecord(BaseModel):
@@ -83,6 +85,8 @@ class InstanceStop(BaseModel):
 class InstanceRead(BaseModel):
     id: UUID
     deployment_id: int
+    # Old durable report receipts omit this field. Do not insert it on replay.
+    replica_index: Annotated[int, Field(ge=0)] | None = None
     start_job_id: int
     worker_id: int | None
     last_attempt_id: int | None
@@ -246,3 +250,47 @@ class RecoveryResult(BaseModel):
 class SchedulingResult(BaseModel):
     assigned_count: int
     assignments: list[SchedulingAssignment]
+
+
+class ReplicaTargetUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    desired_replicas: ReplicaCount
+    expected_version: Annotated[int, Field(strict=True, gt=0)]
+
+
+class ReplicaTargetRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    deployment_id: int
+    desired_replicas: int
+    version: int
+    created_at: AwareDatetime
+    updated_at: AwareDatetime
+
+
+class ReplicaSlotRead(BaseModel):
+    replica_index: int
+    instance_id: UUID
+    start_job_id: int
+
+
+class BlockedReplica(ReplicaSlotRead):
+    reason: Literal["stopped", "terminal_startup_failure"]
+
+
+class ReplicaSummary(ReplicaTargetRead):
+    materialized_replicas: int
+    missing_indexes: list[int]
+    lifecycle_counts: dict[InstanceState, int]
+    retrying_replicas: int
+    expired_ownership_replicas: int
+    unavailable_worker_replicas: int
+    blocked: list[BlockedReplica]
+
+
+class ReconciliationRead(BaseModel):
+    deployment_id: int
+    target_version: int
+    desired_replicas: int
+    created_count: int
+    created: list[ReplicaSlotRead]
+    blocked: list[BlockedReplica]
